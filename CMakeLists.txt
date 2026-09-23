@@ -40,6 +40,14 @@ set(PROJECT_SOURCES
     src/PetBehaviorController.cpp
     src/DesktopPet.h
     src/DesktopPet.cpp
+    src/AffectionSystem.h
+    src/AffectionSystem.cpp
+    src/MainPanel.h
+    src/MainPanel.cpp
+    src/AffectionPage.h
+    src/AffectionPage.cpp
+    src/SettingsPage.h
+    src/SettingsPage.cpp
 )
 
 set(PROJECT_RESOURCES
@@ -96,6 +104,10 @@ set_property(SOURCE
     src/AnimationController.cpp
     src/PetBehaviorController.cpp
     src/DesktopPet.cpp
+    src/AffectionSystem.cpp
+    src/MainPanel.cpp
+    src/AffectionPage.cpp
+    src/SettingsPage.cpp
     APPEND PROPERTY OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/PetConfig.h"
 )
 

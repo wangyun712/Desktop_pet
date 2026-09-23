@@ -30,14 +30,23 @@
 class QTimer;
 class QMenu;
 class QAction;
+class QSystemTrayIcon;
 class AnimationController;
 class PetBehaviorController;
+class AffectionSystem;
+class MainPanel;
+class AffectionPage;
+class SettingsPage;
 
 class DesktopPet : public QWidget
 {
     Q_OBJECT
 public:
     explicit DesktopPet(QWidget* parent = nullptr);
+
+    // 析构时先把托盘图标撤掉。Windows 上如果程序退出时图标还挂在状态栏里，
+    // 那个图标会变成"幽灵"——位置留着、鼠标划过去才消失。手动收一下最稳。
+    ~DesktopPet() override;
 
     // 显示桌宠 + 启动心跳 + 启动自动行为。
     // 注意：构造函数里不做这些，因为要先把图片加载完才知道窗口该多大。
@@ -55,6 +64,26 @@ public:
     //  所以干脆从内部直接切过去抓一张。
     // -----------------------------------------------------------------------
     void debugSetState(PetState s);
+
+    // 托盘状态描述，给 --selftest 用。
+    // 托盘是个"看不见的功能"——出问题时用户只会觉得"点了隐藏就再也叫不回来"，
+    // 所以把可用性、图标有没有建起来、菜单项是否启用都写进自检报告，排错第一步就能看到。
+    QString describeTray() const;
+
+    // 好感度的状态描述，给 --selftest 用（点数、等级、今日额度、存档路径）。
+    QString describeAffection() const;
+
+    // 好感度数据对象。面板页拿它读数字，--affectiontrace 之外没人会改它。
+    AffectionSystem* affection() const { return m_affection; }
+
+    // 【只给 --selftest 用】真的跑一遍"隐藏 -> 恢复"往返，把每一步的窗口可见性、
+    // 心跳开关、自动行为开关都记下来。
+    //
+    // 为什么需要它：点托盘图标这件事没法自动模拟（PostMessage 对 Qt6 不生效，
+    // SendInput 又会真抢用户的鼠标），但"隐藏/恢复有没有把状态收干净"是能直接查的 ——
+    // 时钟基准、心跳定时器、自动行为开关这三样只要漏一个，就会出现
+    // "回来以后顿一下""回来不走路了""明明暂停了却自己动起来"这类怪现象。
+    QString debugTrayRoundTrip();
 
 signals:
     // 「和我聊天」的接口。
@@ -76,6 +105,10 @@ private slots:
     void onActionFinished(PetState finished);            // 一次性动作播完 -> 决定后续
     void onBehaviorState(PetState s, int holdMs);        // 行为控制器要求切换状态
     void onBehaviorWalk(int direction, int durationMs);  // 行为控制器要求走一段路
+
+    // 「和我聊天」的入口：菜单项和面板按钮都走这里 ——
+    // 先记一次好感度，再把信号发出去（发出去之后就不归它管了，接 AI 在主程序里）。
+    void noteChat();
 
 private:
     // ---------- 窗口 ----------
@@ -119,9 +152,24 @@ private:
     void buildMenu();
     void refreshMenuState();
 
+    // ---------- 系统托盘（隐藏到右下角状态栏）----------
+    void setupTray();          // 建托盘图标 + 托盘菜单（构造时调一次）
+    void hideToTray();         // 藏起来：先回站立 -> 停心跳和自动行为 -> hide -> 亮出托盘图标
+    void restoreFromTray();    // 恢复：撤托盘图标 -> show -> 重启心跳 -> 按原来的开关恢复自动行为
+    bool trayReady() const { return m_tray != nullptr; }   // 本机有没有可用的系统托盘
+
+    // ---------- 主面板 ----------
+    // 面板是"第一次点开才建"的（惰性）。理由有两个：
+    //   · 不用面板的用户，程序启动时不该多花时间搭一堆看不见的控件；
+    //   · 藏进状态栏的时候，面板如果早就存在，还得额外记得把它藏起来。
+    // 建好之后就一直留着（关闭只是 hide，不销毁），所以再点开是"秒开"、状态不丢。
+    void openPanel();
+    void closePanel();         // 藏进状态栏时要顺手把面板收起来
+
     // ---------- 数据 ----------
     AnimationController*   m_anim = nullptr;       // 动画控制器
     PetBehaviorController* m_behavior = nullptr;   // 自动行为控制器
+    AffectionSystem*       m_affection = nullptr;  // 好感度（跨面板/点击/菜单共用同一份）
 
     QTimer*       m_tick = nullptr;                // 60Hz 心跳
     QElapsedTimer m_clock;                         // 高精度单调时钟
@@ -156,4 +204,18 @@ private:
     QMenu*   m_menu = nullptr;
     QAction* m_actPause = nullptr;
     QAction* m_actResume = nullptr;
+    QAction* m_actHide = nullptr;
+
+    // ---------- 系统托盘 ----------
+    QSystemTrayIcon* m_tray = nullptr;         // nullptr = 本机没有可用托盘，"隐藏到状态栏"会被禁用
+    QMenu*           m_trayMenu = nullptr;     // 在状态栏图标上右键弹出的那个小面板
+    bool             m_hiddenToTray = false;   // 现在是不是"已经藏进状态栏"的状态
+    bool             m_autoBeforeHide = true;  // 藏起来之前，自动行为是开着还是关着
+
+    // ---------- 主面板 ----------
+    // 注意 m_panel 是顶层窗口（没有 parent），所以必须在本类析构时手动 delete，
+    // 否则它会活到进程结束才被系统回收。
+    MainPanel*     m_panel   = nullptr;
+    AffectionPage* m_affPage = nullptr;
+    SettingsPage*  m_setPage = nullptr;
 };

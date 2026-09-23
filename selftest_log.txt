@@ -1,0 +1,7 @@
+﻿[selftest] checking every pet image in the qrc...
+
+[report] E:\code\DesktopPet\build\ninja-Debug\petpal_selftest.txt
+[image ] E:\code\DesktopPet\build\ninja-Debug\petpal_selftest_preview.png
+
+exit code 0 = all loaded, 2 = some resource missing
+请按任意键继续. . . 

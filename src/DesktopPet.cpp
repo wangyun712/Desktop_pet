@@ -1,6 +1,10 @@
 #include "DesktopPet.h"
 #include "AnimationController.h"
 #include "PetBehaviorController.h"
+#include "AffectionSystem.h"
+#include "MainPanel.h"
+#include "AffectionPage.h"
+#include "SettingsPage.h"
 
 #include <QApplication>
 #include <QGuiApplication>
@@ -11,7 +15,11 @@
 #include <QContextMenuEvent>
 #include <QMenu>
 #include <QAction>
+#include <QSystemTrayIcon>
+#include <QIcon>
 #include <QImage>
+#include <QVBoxLayout>
+#include <QLabel>
 #include <QRandomGenerator>
 #include <QtMath>
 #include <QDebug>
@@ -44,6 +52,38 @@ DesktopPet::DesktopPet(QWidget* parent) : QWidget(parent)
     connect(m_tick, &QTimer::timeout, this, &DesktopPet::onTick);
 
     buildMenu();
+    setupTray();   // 建好托盘图标和菜单，但先不显示 —— 藏进状态栏那一刻才亮出来
+
+    // ---- 好感度 ----
+    // 它是一个独立的数据对象（不带界面），到处都要用：点击、拖动、右键菜单、面板。
+    // 挂在本窗口下面是为了让它随窗口一起销毁，不用手写 delete。
+    m_affection = new AffectionSystem(/*persistent=*/true, this);
+
+    // 升级时给个看得见的反馈：桌宠自己开心一下。
+    // 两个"不行"要挡住 —— 正在被拖着、正在下落的时候切表情，
+    // 会把它从"被拎着"的状态里拽出来，画面会跳。
+    connect(m_affection, &AffectionSystem::leveledUp, this, [this](int) {
+        if (m_dragging || isFalling())
+            return;
+        runChain(QVector<PetState>{ PetState::Happy });
+    });
+
+    // 菜单项的可用状态先刷一次。平时这一步由 contextMenuEvent 负责，
+    // 但"隐藏到状态栏"要靠它根据托盘是否可用来禁用，自检报告也读这个结果。
+    refreshMenuState();
+}
+
+DesktopPet::~DesktopPet()
+{
+    // 程序退出时把托盘图标撤掉。窗口销毁时 QSystemTrayIcon 虽然也会跟着销毁，
+    // 但先 hide() 一次能让 Windows 立刻把状态栏上那个图标摘干净，不留"幽灵图标"。
+    if (m_tray)
+        m_tray->hide();
+
+    // 主面板是顶层窗口（没有 parent），QWidget 的父子自动回收管不到它，必须手动收。
+    // 好感度不在这里 delete —— 它的 parent 是 this，跟着一起走。
+    delete m_panel;
+    m_panel = nullptr;
 }
 
 // =============================================================================
@@ -685,6 +725,11 @@ void DesktopPet::onPetClicked()
     // 提醒行为控制器"用户来过"，并把 5 分钟睡眠计时清零
     m_behavior->notifyUserInteraction();
 
+    // 点它本身也算"摸了一下"：和面板上的「摸摸」共用每天的额度。
+    // 这里不看返回值 —— 额度用完时它照样该有反应（只是不加分），
+    // 不然点到第 11 下它就突然变成一块木头了。
+    m_affection->addFromPet();
+
     if (wasSleeping)
     {
         // 睡觉时被点：SLEEP -> WAVE -> HAPPY -> IDLE
@@ -898,6 +943,11 @@ void DesktopPet::mouseReleaseEvent(QMouseEvent* event)
 
         // 拖完就停在这儿，让行为控制器过一会儿再安排它自己走
         m_behavior->notifyUserInteraction();
+
+        // 拎起来玩了一趟，算一次互动（有 10 秒冷却，免得反复拎着抖）
+        m_affection->addSource(AffectionSystem::Source::Drag,
+                               PetCfg::AFF_DRAG_POINT,
+                               PetCfg::AFF_DRAG_COOLDOWN_MS);
     }
     else
     {
@@ -970,7 +1020,15 @@ void DesktopPet::buildMenu()
     m_menu->addAction(QStringLiteral("和我聊天"), this, [this]()
     {
         m_behavior->notifyUserInteraction();
-        emit chatRequested();
+        noteChat();
+    });
+
+    // ---- 打开面板：右侧弹出一个主面板（左侧是功能导航）----
+    // 面板是惰性创建的，第一次点才建；之后每次点只是把它叫到最前面。
+    m_menu->addAction(QStringLiteral("打开面板"), this, [this]()
+    {
+        m_behavior->notifyUserInteraction();
+        openPanel();
     });
 
     m_menu->addAction(QStringLiteral("开心一下"), this, [this]()
@@ -1051,10 +1109,42 @@ void DesktopPet::buildMenu()
 
     m_menu->addSeparator();
 
+    // ---- 隐藏到状态栏 ----
+    // 注意它和"退出"的区别：隐藏只是把窗口收起来、程序还活着（右下角留一个图标），
+    // 想回来就在那个图标上右键 -> 恢复。
+    m_actHide = m_menu->addAction(QStringLiteral("隐藏到状态栏"), this, [this]()
+    {
+        hideToTray();
+    });
+
     // 退出程序：qApp->quit() 会让 main() 里的 app.exec() 返回
     m_menu->addAction(QStringLiteral("退出"), this, []()
     {
         QApplication::quit();
+    });
+
+    // ---- 菜单里的"玩耍"动作统一记好感度 ----
+    //
+    // ★ 为什么用 QMenu::triggered 统一接，而不是在 10 个 lambda 里各写一行 ★
+    //   以后往菜单里加新动作时，不用记得"还要顺手加一句加分"——
+    //   这是最容易漏、漏了又不会报错的那类改动。
+    //
+    //   代价是得把"不算互动"的几项排除掉，分两类：
+    //     · 系统项（暂停 / 恢复 / 隐藏）：它们只改程序状态，不是陪它玩
+    //     · 入口项（和我聊天 / 打开面板）和退出：各有各的加分逻辑（聊天 +3），
+    //       或者根本不该算（退出）
+    connect(m_menu, &QMenu::triggered, this, [this](QAction* a) {
+        if (!a || a == m_actPause || a == m_actResume || a == m_actHide)
+            return;
+
+        const QString t = a->text();
+        if (t == QStringLiteral("和我聊天") || t == QStringLiteral("打开面板") || t == QStringLiteral("退出"))
+            return;
+
+        if (m_affection)
+            m_affection->addSource(AffectionSystem::Source::MenuAction,
+                                   PetCfg::AFF_MENU_POINT,
+                                   PetCfg::AFF_MENU_COOLDOWN_MS);
     });
 }
 
@@ -1065,4 +1155,278 @@ void DesktopPet::refreshMenuState()
         m_actPause->setEnabled(autoOn);
     if (m_actResume)
         m_actResume->setEnabled(!autoOn);
+
+    // 万一本机没有系统托盘（极罕见），点了"隐藏"就再也叫不回来了 —— 直接禁掉
+    if (m_actHide)
+        m_actHide->setEnabled(trayReady());
+}
+
+// =============================================================================
+//  系统托盘：藏进右下角状态栏，以及从那里恢复
+//
+//  和"退出"的区别（菜单里这两项挨着，最容易混）：
+//      隐藏  -> 窗口收起来、状态栏出现图标、程序继续活着、状态都还在
+//      退出  -> 进程结束
+// =============================================================================
+void DesktopPet::setupTray()
+{
+    if (!QSystemTrayIcon::isSystemTrayAvailable())
+    {
+        // 没有托盘的话，"隐藏"就是一张有去无回的单程票，
+        // 所以这里干脆不建托盘，菜单里那一项也会被 refreshMenuState() 禁掉。
+        qWarning() << "[PetPal] 本机没有可用的系统托盘，「隐藏到状态栏」已禁用";
+        return;
+    }
+
+    m_tray = new QSystemTrayIcon(this);
+
+    // ---- 图标：不另做 .ico，直接拿站立图缩出来 ----
+    // 按几个常用尺寸各烘一份交给系统去挑，100% / 150% 缩放下都不糊（本机是 150%）。
+    QIcon icon;
+    const QPixmap src(petImagePath(PetCfg::TRAY_ICON_IMG));
+    if (!src.isNull())
+    {
+        static const int sizes[] = { 16, 20, 24, 32, 48 };
+        for (int px : sizes)
+            icon.addPixmap(src.scaled(px, px, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    }
+    else
+    {
+        qWarning() << "[PetPal] 托盘图标用的站立图没加载出来，退回默认图标";
+    }
+    m_tray->setIcon(icon);
+    m_tray->setToolTip(QStringLiteral("PetPal 桌宠 —— 左键单击回来，右键看菜单"));
+
+    // ---- 状态栏图标上右键弹出的那个小面板：恢复 / 退出 ----
+    m_trayMenu = new QMenu(this);
+    m_trayMenu->addAction(QStringLiteral("恢复"), this, [this]()
+    {
+        restoreFromTray();
+    });
+    m_trayMenu->addSeparator();
+    m_trayMenu->addAction(QStringLiteral("退出"), this, []()
+    {
+        QApplication::quit();
+    });
+    m_tray->setContextMenu(m_trayMenu);
+
+    // 左键单击也直接恢复 —— 这是 Windows 上托盘图标最顺手的用法，
+    // 只有想退出的人才去右键。
+    connect(m_tray, &QSystemTrayIcon::activated, this,
+            [this](QSystemTrayIcon::ActivationReason reason)
+    {
+        if (reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick)
+            restoreFromTray();
+    });
+
+    // ★ 这里故意不调 m_tray->show() ★
+    // 托盘图标只在"藏进状态栏"之后才出现。平时桌宠本来就站在屏幕上，
+    // 再挂一个状态栏图标等于同一只宠物开了两个入口，反而乱。
+}
+
+void DesktopPet::hideToTray()
+{
+    if (m_hiddenToTray || !trayReady())
+        return;
+
+    // 藏之前先收拾干净：
+    //   · stopMoving() 让它落地停步 —— 否则藏起来的这段时间它还在"走"，
+    //     再放出来时位置已经跑到别处去了；
+    //   · goIdle() 回到站立，状态栏图标用的也是这张站姿图，视觉上对得上。
+    stopMoving();
+    goIdle();
+
+    // 记住用户原本有没有暂停自动行为，回来时原样还回去（别擅自帮他打开）
+    m_autoBeforeHide = m_behavior->autoEnabled();
+    m_behavior->setAutoEnabled(false);
+
+    // 60Hz 心跳也停掉：窗口都看不见了，没必要每秒还算 60 次位置
+    m_tick->stop();
+
+    // 好感度的"陪伴"加分也要停 —— 人都看不见了，不该继续算陪伴。
+    // （不加这一句的话，把桌宠藏起来挂一整天也能刷满陪伴分，那就失去意义了）
+    m_affection->setCompanyActive(false);
+
+    // 面板一起收起来：桌宠都藏了，面板还杵在屏幕正中会很莫名其妙
+    closePanel();
+
+    m_hiddenToTray = true;
+    hide();            // 窗口消失
+    m_tray->show();    // 状态栏图标出现
+}
+
+void DesktopPet::restoreFromTray()
+{
+    if (!m_hiddenToTray)
+        return;
+
+    m_tray->hide();    // 图标撤掉
+    m_hiddenToTray = false;
+
+    show();            // 窗口原样回来（位置和尺寸都没动过）
+
+    // ★ 时钟基准必须重取 ★
+    // m_clock 是单调时钟，藏起来的整段时间它一直在走。不重取的话，
+    // 恢复后第一次心跳算出的 dt 是"藏了多久"——虽然 MAX_TICK_DT_S 会兜住，
+    // 但那是把它当垃圾丢掉，画面会顿一下。这里重新对一次基准最干净。
+    m_clock.start();
+    m_lastNs = m_clock.nsecsElapsed();
+    m_tick->start(PetCfg::TICK_MS);
+
+    // 按藏之前的开关恢复自动行为：藏之前是暂停的，回来还是暂停
+    if (m_autoBeforeHide)
+        m_behavior->setAutoEnabled(true);
+
+    // 陪伴加分重新开始计
+    m_affection->setCompanyActive(true);
+
+    m_behavior->notifyUserInteraction();   // 清零"多久没互动"，别一放出来就犯困
+}
+
+// -----------------------------------------------------------------------------
+//  托盘状态描述（--selftest 报告用，详细理由见头文件）
+// -----------------------------------------------------------------------------
+QString DesktopPet::describeTray() const
+{
+    QString s;
+    s += QStringLiteral("系统托盘可用     : %1\r\n")
+             .arg(QSystemTrayIcon::isSystemTrayAvailable() ? QStringLiteral("是")
+                                                          : QStringLiteral("否（「隐藏到状态栏」会被禁用）"));
+    s += QStringLiteral("托盘图标         : %1\r\n")
+             .arg(m_tray ? QStringLiteral("已创建（由站立图缩出 16/20/24/32/48 五档）")
+                         : QStringLiteral("未创建"));
+    s += QStringLiteral("托盘右键菜单     : %1\r\n")
+             .arg(m_trayMenu ? QStringLiteral("恢复 / 退出 —— 共 2 项")
+                             : QStringLiteral("未创建"));
+    s += QStringLiteral("「隐藏到状态栏」 : %1\r\n")
+             .arg((m_actHide && m_actHide->isEnabled())
+                      ? QStringLiteral("已启用（在「退出」上方）")
+                      : QStringLiteral("已禁用"));
+    s += QStringLiteral("当前是否已隐藏   : %1\r\n")
+             .arg(m_hiddenToTray ? QStringLiteral("是（程序还活着，图标在状态栏）")
+                                 : QStringLiteral("否（桌宠显示在桌面上）"));
+    return s;
+}
+
+// -----------------------------------------------------------------------------
+//  隐藏 -> 恢复 往返测试（--selftest 用，详细理由见头文件）
+//
+//  走的是和菜单项、托盘图标完全一样的两条路径（hideToTray / restoreFromTray），
+//  不是另写一套等价的代码 —— 否则测过了也不代表真实操作没问题。
+// -----------------------------------------------------------------------------
+QString DesktopPet::debugTrayRoundTrip()
+{
+    if (!trayReady())
+        return QStringLiteral("  [跳过] 本机没有可用的系统托盘\r\n");
+
+    const auto yn = [](bool b) { return b ? QStringLiteral("是") : QStringLiteral("否"); };
+
+    QString s;
+    s += QStringLiteral("  隐藏前 : 窗口可见=%1  心跳=%2  自动行为=%3\r\n")
+             .arg(yn(isVisible()), yn(m_tick->isActive()), yn(m_behavior->autoEnabled()));
+
+    hideToTray();
+    s += QStringLiteral("  隐藏后 : 窗口可见=%1  心跳=%2  自动行为=%3  状态栏图标=%4\r\n")
+             .arg(yn(isVisible()), yn(m_tick->isActive()), yn(m_behavior->autoEnabled()),
+                  yn(m_tray->isVisible()));
+
+    restoreFromTray();
+    s += QStringLiteral("  恢复后 : 窗口可见=%1  心跳=%2  自动行为=%3  状态栏图标=%4\r\n")
+             .arg(yn(isVisible()), yn(m_tick->isActive()), yn(m_behavior->autoEnabled()),
+                  yn(m_tray->isVisible()));
+
+    // 往返一趟之后应该完全回到原样：窗口在、心跳在跑、隐藏标记清掉
+    const bool ok = isVisible() && m_tick->isActive() && !m_hiddenToTray && !m_tray->isVisible();
+    s += ok ? QStringLiteral("  [OK] 隐藏/恢复往返正常，状态都收回来了\r\n")
+            : QStringLiteral("  [!!] 往返之后状态不对，检查 hideToTray / restoreFromTray\r\n");
+    return s;
+}
+
+// =============================================================================
+//  主面板
+// =============================================================================
+
+// 还没做的功能页：一句说明文字占个位置。
+// 留着它是为了让左侧导航一开始就是"一个功能列表"的样子 —— 加新页时，
+// 只要写一个 QWidget 调 addPage()，布局代码一行都不用动。
+static QWidget* makePlaceholderPage(const QString& title)
+{
+    auto* page = new QWidget;
+    auto* v = new QVBoxLayout(page);
+    v->setContentsMargins(20, 16, 20, 16);
+
+    auto* lab = new QLabel(QStringLiteral("%1\n\n这一页还没做，先把位置占住").arg(title), page);
+    lab->setAlignment(Qt::AlignCenter);
+    lab->setStyleSheet(QStringLiteral("color: #B4B2A9; font-size: 13px;"));
+    v->addWidget(lab);
+    return page;
+}
+
+void DesktopPet::openPanel()
+{
+    if (!m_panel)
+    {
+        // 第一次点开才建。之后一直留着（关闭只是 hide），所以再点开是秒开、状态不丢。
+        m_panel = new MainPanel(nullptr);        // 顶层窗口，没有 parent，析构时手动 delete
+
+        // ---- 好感度页 ----
+        m_affPage = new AffectionPage(m_affection, m_panel);
+        m_panel->addPage(QStringLiteral("好感度"), m_affPage);
+
+        // ★ 页面只喊"用户想做什么"，怎么响应由这里决定 ★
+        //  加分和播动画必须成对发生，所以两件事写在同一个 lambda 里。
+        //  如果让页面自己加分、这里只播动画，以后改规则要同时改两个文件，
+        //  迟早出现"加了分没播动画"或者"额度用完了还在播"。
+        connect(m_affPage, &AffectionPage::petPetted, this, [this]() {
+            // 返回 0 说明额度用完或还在冷却 —— 那就什么也不做（面板按钮此时本来就是灰的）
+            if (m_affection->addFromPet() > 0.0)
+                runChain(QVector<PetState>{ PetState::Happy });          // 摸摸 -> 开心
+        });
+
+        connect(m_affPage, &AffectionPage::feedRequested, this, [this]() {
+            if (m_affection->addFromFeed() > 0.0)
+                runChain(QVector<PetState>{ PetState::Eat, PetState::Happy });  // 喂食 -> 吃东西
+        });
+
+        connect(m_affPage, &AffectionPage::chatRequested, this, &DesktopPet::noteChat);
+
+        // ---- 预留页（排在设置前面，和左侧导航的顺序一致）----
+        m_panel->addPage(QStringLiteral("聊天"), makePlaceholderPage(QStringLiteral("聊天")));
+
+        // ---- 设置页 ----
+        // 弹窗确认已经在页面里做完了（那是界面自己的事），这里收到的信号
+        // 只代表"用户确实点过确认"。真正清零这一下仍然放在这里 ——
+        // 和摸摸/喂食同一个规矩：页面只喊意图，谁持有数据谁动手。
+        m_setPage = new SettingsPage(m_affection, m_panel);
+        m_panel->addPage(QStringLiteral("设置"), m_setPage);
+
+        connect(m_setPage, &SettingsPage::resetAffectionRequested, this, [this]() {
+            // resetAll() 内部会 save() + emit changed()，
+            // 所以两个页面的数字会自动刷新，不用在这里手动通知。
+            m_affection->resetAll();
+        });
+    }
+
+    // 居中在"桌宠所在的那块屏幕"，不是主屏。
+    // 双屏时这一点很关键：桌宠在副屏上待着，面板却弹到主屏正中，会像是别的程序弹出来的。
+    m_panel->showCenteredIn(availableScreenRect());
+}
+
+void DesktopPet::closePanel()
+{
+    if (m_panel && m_panel->isVisible())
+        m_panel->hide();
+}
+
+void DesktopPet::noteChat()
+{
+    // 先记一笔好感度，再交出去。
+    // 第一阶段没人接这个信号（只打日志），但分照记 —— 以后接上 Qwen 就不用回头补。
+    m_affection->addSource(AffectionSystem::Source::Chat, PetCfg::AFF_CHAT_POINT);
+    emit chatRequested();
+}
+
+QString DesktopPet::describeAffection() const
+{
+    return m_affection ? m_affection->describe() : QStringLiteral("好感度对象不存在\r\n");
 }

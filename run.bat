@@ -9,6 +9,7 @@ rem    run.bat release     launch the Release build
 rem    run.bat selftest    resource self-check, write a report
 rem    run.bat walktrace   dump the walk playback order, write a report
 rem    run.bat falltrace   dump the gravity fall trajectory, write a report
+rem    run.bat affectiontrace  dump the affection timeline (per-day, decay), write a report
 rem
 rem  WHY this file exists:
 rem    PetPal.exe links Qt6 dynamically. Windows only finds those DLLs
@@ -82,11 +83,21 @@ if /I "%~1"=="falltrace" (
   exit /b 0
 )
 
+if /I "%~1"=="affectiontrace" (
+  echo [affectiontrace] simulating days: daily quota reset + decay...
+  "%EXE%" --affectiontrace
+  echo.
+  echo [report] %EXEDIR%petpal_affectiontrace.txt
+  echo.
+  pause
+  endlocal
+  exit /b 0
+)
+
 echo [run] %EXE%
 start "" "%EXE%"
 endlocal
 exit /b 0
-
 :fail
 pause
 endlocal

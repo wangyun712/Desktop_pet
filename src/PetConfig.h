@@ -150,6 +150,12 @@ constexpr int MENU_FLY_MS        = 4000;   // 飞行 4 秒
 constexpr int MENU_SLEEP_MS      = 0;      // 0 = 一直睡，直到用户点它
 constexpr int MENU_IDLE_MS       = 0;      // 0 = 一直待机（不定时）
 
+// ---------- 隐藏到系统托盘（右下角状态栏）----------
+// 托盘图标不另外做 .ico，直接把现成的站立图缩小来用 —— 和待机时的样子一致，
+// 用户在状态栏一眼就能认出是自己的桌宠。想换成别的表情，改这个编号即可
+//（对照上面「图片编号 -> 路径」那张表，比如 13 是打瞌睡、21 是飞行）。
+constexpr int TRAY_ICON_IMG      = 8;      // 8 = 08_站立.png
+
 // ---------- 行走序列（22~29 这 8 张图）----------
 //
 //  ★ 一次完整的走路不是「22→29 顺序循环」，而是三个阶段：★
@@ -177,7 +183,97 @@ constexpr int WALK_SHORTEST_MS  = WALK_STOP_MS + WALK_FRAME_MS * WALK_LOOP_COUNT
 
 // ---------- 点击时的随机动作 ----------
 constexpr int SLEEP_WAKE_WAVE_MS = ACTION_MID_MS;
+
+// ---------- 好感度 ----------
+//
+//  ★ 数值设计的三条原则（想调数值先看这三条，别只改数字）★
+//
+//    ① 升级越来越慢：升到下一级要 BASE + STEP * 当前等级 点，
+//       也就是 Lv1->2 要 30 点、Lv2->3 要 40 点 …… Lv9->10 要 110 点，
+//       满级累计 630 点。差距要拉得开，面板上的进度条才有"在爬"的感觉。
+//
+//    ② 每天有额度：摸摸、喂食都是"每天固定几次"，用完当天就不再给分。
+//       没有额度的话，一手狂点就能把好感刷满，养成感立刻归零。
+//
+//    ③ 衰减轻、且不降级：0.5 点/小时 ≈ 12 点/天，而且只吃"本级已经攒到的进度"，
+//       掉到本级起点就停 —— 有"常来看看它"的牵引力，但不会让人觉得白养。
+constexpr int    AFF_MAX_LEVEL        = 10;         // 等级上限
+constexpr double AFF_LEVEL_BASE       = 20.0;       // 升级所需 = BASE + STEP * 当前等级
+constexpr double AFF_LEVEL_STEP       = 10.0;
+
+constexpr double AFF_DECAY_PER_HOUR   = 0.5;        // 自然衰减（点/小时）
+constexpr int    AFF_DECAY_TICK_MS    = 30000;      // 每 30 秒结算一次
+// 单次结算最多按 30 分钟算。电脑睡眠、主线程卡死之后，实测间隔可能是几小时，
+// 不加这个上限的话，一觉醒来好感度会被一次性扣掉一大截。
+constexpr int    AFF_DECAY_WINDOW_MS  = 30 * 60 * 1000;
+constexpr double AFF_DECAY_MAX_TICK   = 1.0;        // 单次结算最多扣 1 点（兜底）
+
+// ★ "从没触发过"的冷却哨兵值 —— 别拿 0 代替 ★
+//   0 正好是内部时钟的原点。程序刚启动、或者刚重置完好感度时，nowMs() 才几十毫秒，
+//   "现在 - 上次" 必然小于任何冷却时长，于是第一次操作反而被当成"连点太快"挡掉。
+//   （重置后紧接着点「摸摸」加不上分，就是这个原因。）
+constexpr qint64 AFF_NO_COOLDOWN     = -1;
+
+constexpr int    AFF_PET_PER_DAY      = 10;         // 每天能摸几次
+constexpr double AFF_PET_POINT        = 1.0;
+constexpr int    AFF_PET_COOLDOWN_MS  = 3000;       // 两次摸摸之间至少隔 3 秒（防连点）
+constexpr int    AFF_FEED_PER_DAY     = 3;          // 每天能喂几次
+constexpr double AFF_FEED_POINT       = 5.0;
+
+constexpr double AFF_DRAG_POINT       = 1.0;        // 拎起来拖一段（松手时结算）
+constexpr int    AFF_DRAG_COOLDOWN_MS = 10000;
+constexpr double AFF_MENU_POINT       = 2.0;        // 右键菜单里的玩耍动作
+constexpr int    AFF_MENU_COOLDOWN_MS = 30000;
+constexpr double AFF_CHAT_POINT       = 3.0;        // 聊天（现在只打日志，以后接 Qwen）
+constexpr int    AFF_CHAT_PER_DAY     = 5;          //聊天每天能加几次
+
+constexpr double AFF_COMPANY_POINT    = 1.0;        // 纯陪伴：程序开着就慢慢加
+constexpr int    AFF_COMPANY_EVERY_MS = 30 * 60 * 1000;   // 每 30 分钟 +1
+constexpr double AFF_COMPANY_MAX_DAY  = 24.0;       // 陪伴分每天最多 24（= 12 小时）
+
+// 面板配色。主色取角色紫发的那个紫，和桌宠整体风格统一
+constexpr const char* AFF_ACCENT      = "#7F77DD";
+constexpr const char* AFF_ACCENT_DARK = "#534AB7";
+constexpr const char* AFF_TRACK       = "#F1EFE8";
+constexpr const char* AFF_TEXT_MUTED  = "#888780";
+constexpr const char* AFF_TEXT_MAIN   = "#2C2C2A";
+
 }   // namespace PetCfg
+
+// -----------------------------------------------------------------------------
+//  二·六、好感度的等级数学
+//
+//  这里只有公式，具体的分数存在 AffectionSystem 里。
+//  之所以把"要多少点"做成函数而不是一张表：这样调整 BASE/STEP 两个数，
+//  10 个等级的门槛、进度条、自检报告会一起跟着变，不会出现"表格改了公式没改"。
+// -----------------------------------------------------------------------------
+// 升到下一级要多少点：Lv1->2 要 30 点，Lv9->10 要 110 点
+constexpr double affLevelNeed(int level)
+{
+    return PetCfg::AFF_LEVEL_BASE + PetCfg::AFF_LEVEL_STEP * double(level);
+}
+
+// 第 level 级的起点（从 0 分开始累计）。affLevelFloor(1) = 0，affLevelFloor(10) = 630
+constexpr double affLevelFloor(int level)
+{
+    double sum = 0.0;
+    for (int L = 1; L < level; ++L)
+        sum += affLevelNeed(L);
+    return sum;
+}
+
+// 5 个阶段的称号：等级 1-2 / 3-4 / 5-6 / 7-8 / 9-10 各一个
+inline QString affStageName(int stageIndex)
+{
+    switch (stageIndex)
+    {
+    case 0:  return QStringLiteral("最初相逢");
+    case 1:  return QStringLiteral("心上华海");
+    case 2:  return QStringLiteral("浅梦低语");
+    case 3:  return QStringLiteral("初心华梦");
+    default: return QStringLiteral("依为心生");
+    }
+}
 
 // -----------------------------------------------------------------------------
 //  二·五、自由落体的一步积分
