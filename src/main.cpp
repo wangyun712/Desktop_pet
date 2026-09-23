@@ -33,6 +33,7 @@
 #include "AffectionSystem.h"
 #include "AffectionPage.h"
 #include "SettingsPage.h"
+#include "DailyImagePage.h"
 #include "MainPanel.h"
 
 // -----------------------------------------------------------------------------
@@ -59,7 +60,9 @@
 //    petpal_selftest_fall.png     —— 下落状态离屏渲染出来的实际画面
 //    petpal_tray_icons.png        —— 托盘图标真正用到的 5 档尺寸（放大 4 倍并排）
 //    petpal_selftest_panel.png    —— 主面板（左侧导航 + 好感度页）离屏渲染出来的样子
+//    petpal_selftest_daily.png    —— 主面板的「每日图片」页（今天随机到的那张）
 //    petpal_selftest_settings.png —— 主面板的「设置」页（重置好感度那张卡片）
+//    petpal_selftest_panel_max.png—— 主面板放大（铺满屏幕）之后的样子
 //    petpal_selftest_confirm.png  —— 重置前弹出的确认框（验证默认按钮落在「取消」上）
 //
 //  用法：PetPal.exe --selftest
@@ -350,8 +353,8 @@ static QString runAffectionTrace()
                .arg(quotaBlockedOk ? QStringLiteral("OK") : QStringLiteral("!!"))
                .arg(PetCfg::AFF_PET_PER_DAY + 1);
     out += QStringLiteral("     到 Lv.5 用了 %1 天；%2\r\n")
-               .arg(reachedLv5Day > 0 ? QString::number(reachedLv5Day) : QStringLiteral("30 天还没到"))
-               .arg(reachedMaxDay > 0
+               .arg(reachedLv5Day > 0 ? QString::number(reachedLv5Day) : QStringLiteral("30 天还没到"),
+                    reachedMaxDay > 0
                         ? QStringLiteral("满级（Lv.%1）用了 %2 天").arg(PetCfg::AFF_MAX_LEVEL).arg(reachedMaxDay)
                         : QStringLiteral("30 天内没满级"));
     out += QStringLiteral("     这 30 天平均每天净增 +%1 点（动作分 %2 + 陪伴 %3 - 衰减 %4）\r\n\r\n")
@@ -559,6 +562,12 @@ static int runSelfTest()
                 ts << pet.describeTray();
                 ts << QStringLiteral("\r\n隐藏/恢复往返测试（走的就是菜单项和托盘图标调的那两条路径）:\r\n");
                 ts << pet.debugTrayRoundTrip();
+
+                // 每日图片：图片在磁盘上（不在 .qrc 里），这一节说明"目录找没找到、
+                // 今天该显示哪张、会不会一天之内变来变去"。
+                ts << QStringLiteral("\r\n--- 每日图片（主面板那一页）---\r\n");
+                ts << DailyImagePage::describeDailyImage();
+
                 ts.flush();
                 f.close();
             }
@@ -628,9 +637,11 @@ static int runSelfTest()
         {
             MainPanel panel;
             panel.setAttribute(Qt::WA_DontShowOnScreen, true);
-            panel.addPage(QStringLiteral("好感度"), new AffectionPage(pet.affection(), &panel));
-            panel.addPage(QStringLiteral("聊天"),   new QLabel(QStringLiteral("这一页还没做，先把位置占住"), &panel));
-            panel.addPage(QStringLiteral("设置"),   new SettingsPage(pet.affection(), &panel));
+            panel.addPage(QStringLiteral("好感度"),   new AffectionPage(pet.affection(), &panel));
+            // 只读模式：自检不该把用户当天的图重新抽一遍
+            panel.addPage(QStringLiteral("每日图片"), new DailyImagePage(/*persistent=*/false, &panel));
+            panel.addPage(QStringLiteral("聊天"),     new QLabel(QStringLiteral("这一页还没做，先把位置占住"), &panel));
+            panel.addPage(QStringLiteral("设置"),     new SettingsPage(pet.affection(), &panel));
             panel.show();
             QApplication::processEvents();
 
@@ -648,13 +659,26 @@ static int runSelfTest()
                 canvas.save(exeDir.filePath(fileName));
             };
 
-            shoot(QStringLiteral("petpal_selftest_panel.png"));     // 默认停在第一页：好感度
+            shoot(QStringLiteral("petpal_selftest_panel.png"));     // 第 0 页：好感度
 
-            // 「设置」页是新加的，也留一张 —— 重置按钮和那张卡片是纯样式表堆出来的，
-            // 排错行只能看图。
-            panel.setCurrentPage(2);
+            // 「每日图片」：这一页的成败全看"图有没有等比放进框里、有没有被拉变形"，
+            // 报告里写多少句都不如一张图。
+            panel.setCurrentPage(1);
+            QApplication::processEvents();
+            shoot(QStringLiteral("petpal_selftest_daily.png"));
+
+            // 「设置」页：重置按钮和那张卡片是纯样式表堆出来的，排错行只能看图。
+            panel.setCurrentPage(3);
             QApplication::processEvents();
             shoot(QStringLiteral("petpal_selftest_settings.png"));
+
+            // 放大状态：三处只有看图才知道对不对 —— 圆角有没有变成直角
+            //（留着圆角的话铺满屏幕时四角会各透出一块桌面）、放大按钮有没有换成"还原"图标、
+            // 顶部条那三个按钮在铺满之后是不是还老老实实靠右。
+            panel.setCurrentPage(0);
+            panel.toggleMaximized();
+            QApplication::processEvents();
+            shoot(QStringLiteral("petpal_selftest_panel_max.png"));
         }
 
         // ---------- 重置确认框 ----------

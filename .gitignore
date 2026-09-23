@@ -35,6 +35,18 @@ CMakeLists.txt.user*
 # ---- 工作区元数据（工作笔记 + 素材原始备份）----
 .workbuddy/
 
+# ---- 个人图库，不进版本库 ----
+# 「每日图片」页读的是用户自己的图（resources/daily_image/），每人一份，
+# 不该跟着仓库走 —— 克隆的人想要自己的图，而不是被作者的图覆盖。
+# 20 张 / 67MB，之前误提交过一次（已从 HEAD 提交里移除）。
+# 不影响运行：图还在磁盘上，只是 git 不再跟踪；打包分发时照常拷 resources/ 整个文件夹。
+resources/daily_image/
+
+# ---- 构建 / 自检日志 ----
+# 构建和自检的输出是重定向到根目录的 .txt，不是 .log，所以上面那条 *.log 拦不住，
+# 曾经被误提交过 7 个（build_jom_log*.txt / build_log.txt / selftest_log.txt）。
+*_log*.txt
+
 # ---- 系统杂项 ----
 Thumbs.db
 Desktop.ini

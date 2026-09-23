@@ -14,6 +14,7 @@
 
 #include <QWidget>
 #include <QPoint>
+#include <QRect>
 
 class QListWidget;
 class QStackedWidget;
@@ -37,6 +38,11 @@ public:
     // 是为了让面板跟着"桌宠在哪块屏幕"走 —— 多显示器时这一点很重要。
     void showCenteredIn(const QRect& screenRect);
 
+    // 放大/还原切换（顶部条那个 □ 按钮）。铺满当前屏幕的可用区，
+    // 不盖任务栏 —— 面板不是播放器，压住任务栏只会让人没法切窗口。
+    void toggleMaximized();
+    bool isMaximizedPanel() const { return m_maximized; }
+
 protected:
     void paintEvent(QPaintEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
@@ -46,11 +52,19 @@ protected:
 private:
     static constexpr int TOP_BAR_H = 38;    // 顶部条高度：既是标题栏，也是拖动把手
 
+    void updateMaxButtonIcon();             // □ / ❐ 跟着最大化状态切
+
     QWidget*        m_topBar   = nullptr;
     QListWidget*    m_nav      = nullptr;
     QStackedWidget* m_stack    = nullptr;
-    QPushButton*    m_closeBtn = nullptr;
+    QPushButton*    m_minBtn   = nullptr;   // 最小化
+    QPushButton*    m_maxBtn   = nullptr;   // 放大 / 还原
+    QPushButton*    m_closeBtn = nullptr;   // 关闭
 
     QPoint m_dragOffset;                    // 拖动时鼠标相对窗口左上角的偏移
     bool   m_dragging = false;
+
+    // 放大/还原用。放大前的几何要留着，还原时原样放回去。
+    bool  m_maximized = false;
+    QRect m_restoreGeometry;
 };

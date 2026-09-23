@@ -3,6 +3,24 @@ cmake_minimum_required(VERSION 3.24)
 project(PetPal LANGUAGES C CXX)
 
 # ---------------------------------------------------------------------------
+#  ★ 头文件依赖的治本开关：不要让编译器去生成依赖 ★
+#
+#  默认（TRUE）时，Makefile / JOM 生成器靠 MSVC 的 /showIncludes 输出来算依赖。
+#  本机这套环境里那个输出没被写进 *.cpp.obj.d（实测全是 0 字节），
+#  于是 JOM 完全不知道 .obj 依赖哪些头文件 —— 改了头文件，只有"自身也一起改过"
+#  的 .cpp 会重编，其余不重编。
+#
+#  这不是"改代码没生效"这么轻的事：改一个类的成员变量后新旧混编，
+#  构造函数写越界堆块（new 的 sizeof 来自旧头文件），Debug 版直接报
+#  "HEAP CORRUPTION DETECTED ... wrote to memory after end of heap buffer"。
+#  代码一行没错，却能崩给你看。
+#
+#  设成 FALSE = 回到 CMake 3.20 之前的行为，用 CMake 自己的依赖扫描器，可靠。
+#  见文件后半段那段"头文件依赖"注释，那里还有第二道保险。
+# ---------------------------------------------------------------------------
+set(CMAKE_DEPENDS_USE_COMPILER FALSE)
+
+# ---------------------------------------------------------------------------
 #  C++ 标准
 # ---------------------------------------------------------------------------
 set(CMAKE_CXX_STANDARD 17)
@@ -48,6 +66,8 @@ set(PROJECT_SOURCES
     src/AffectionPage.cpp
     src/SettingsPage.h
     src/SettingsPage.cpp
+    src/DailyImagePage.h
+    src/DailyImagePage.cpp
 )
 
 set(PROJECT_RESOURCES
@@ -75,30 +95,48 @@ target_link_libraries(PetPal PRIVATE
 )
 
 # ---------------------------------------------------------------------------
-#  ★ 头文件依赖 —— 这一行是"踩坑补丁"，别删 ★
+#  ★ 头文件依赖（第二道保险）—— 这段别删 ★
 #
-#  PetConfig.h 是本项目唯一的公共头文件（状态枚举 + 全部可调参数 + 帧序列表），
-#  每个 .cpp 都 include 它。正常情况 CMake 会自动扫描 #include 生成依赖，
-#  但在本机用 JOM（NMake Makefiles JOM，也正是 Qt Creator 用的那个生成器）时，
-#  MSVC 的 /showIncludes 依赖没有被写进 .d 文件 ——
-#  实测 DesktopPet.cpp.obj.d / AnimationController.cpp.obj.d / main.cpp.obj.d
-#  全都是 0 字节。于是 JOM 完全不知道这些 .obj 依赖 PetConfig.h：
-#  改了 PetConfig.h，除了自身也一起改过的那个 .cpp，其余编译单元一律不重编，
-#  链接出来的 exe 里内联的还是旧常量，表现为"明明改了代码却一点没生效"。
+#  症状一（轻）：改了头文件里的常量，exe 里还是旧值，"明明改了却没生效"。
+#  症状二（重，2026-09-23 真实踩到）：改 MainPanel.h 加了成员变量后，
+#    MainPanel.cpp 重编了、而 DesktopPet.cpp 没重编 —— 于是 DesktopPet.cpp 里
+#    `new MainPanel(...)` 用的是**旧的 sizeof**（编译期常量），
+#    分配出来的块比构造函数要写的小，构造函数往块尾之外写成员。
+#    Debug 版 CRT 当场报：
+#      HEAP CORRUPTION DETECTED: after Normal block (#xxxxx) ...
+#      CRT detected that the application wrote to memory after end of heap buffer.
+#    这种崩溃最难查 —— 代码一行都没写错，错的是"编译单元之间的版本不一致"。
 #
-#  真实踩坑记录：PetCfg::PET_IMAGE_COUNT 从 29 改成 30（新增拖拽图 p30）后，
-#  Qt Creator 构建出的 exe 自检仍报"应加载图片 29 张"，新图怎么都不显示；
-#  而 Ninja（用二进制 depfile 数据库）构建的 exe 一切正常 —— 差别就在这里。
+#  根因：JOM（NMake Makefiles JOM，Qt Creator 用的生成器）下，
+#  MSVC 的 /showIncludes 依赖没被写进 .d 文件（实测 *.cpp.obj.d 全是 0 字节）。
+#  JOM 于是完全不知道 .obj 依赖哪些头文件，只有"那个 .cpp 自身也改过"时才重编。
+#  Ninja 用二进制 depfile，不受影响 —— 所以同一份代码两条构建路径表现不同。
 #
-#  下面这几行给这几个 .cpp 显式挂上"依赖 PetConfig.h"，不依赖任何自动扫描机制，
-#  Ninja 和 JOM 都会老老实实重编。
+#  两道保险：
+#    ① 文件开头的 `set(CMAKE_DEPENDS_USE_COMPILER FALSE)` —— 让 CMake 用它自己的
+#       依赖扫描器，不再指望编译器的 /showIncludes 输出。这是治本。
+#    ② 这段：显式给每个 .cpp 挂上 src/ 下所有头文件。不依赖任何自动扫描机制，
+#       就算哪天开关又失效，JOM 也照样会重编。
 #
-#  为什么逐个文件列、而不用 target 级的 OBJECT_DEPENDS？
+#  为什么逐个文件列、而不用 target 级 OBJECT_DEPENDS？
 #  因为 target 级会把自动生成的 13MB 的 qrc_resources.cpp 也算进来 ——
-#  它根本不 include PetConfig.h，却会因为改一个常量就被重编十几秒。
-#  逐文件列之后，"改个参数"只需要重编这 4 个 .cpp。
-#  以后新增 .cpp 且用到了 PetConfig.h，记得往这里补一行。
+#  它不 include 任何项目头文件，却会因改一个常量就被重编十几秒。
+#
+#  ★ 维护规则：新增 .cpp 往下面列表补一行；新增 .h 往 PETPAL_HEADERS 补一行。★
+#    漏了也不会报错，只会退化成"偶尔要手动全量重编"——所以宁可麻烦一点。
 # ---------------------------------------------------------------------------
+set(PETPAL_HEADERS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/PetConfig.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/AnimationController.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/PetBehaviorController.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/DesktopPet.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/AffectionSystem.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/MainPanel.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/AffectionPage.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/SettingsPage.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/DailyImagePage.h"
+)
+
 set_property(SOURCE
     src/main.cpp
     src/AnimationController.cpp
@@ -108,7 +146,8 @@ set_property(SOURCE
     src/MainPanel.cpp
     src/AffectionPage.cpp
     src/SettingsPage.cpp
-    APPEND PROPERTY OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/PetConfig.h"
+    src/DailyImagePage.cpp
+    APPEND PROPERTY OBJECT_DEPENDS ${PETPAL_HEADERS}
 )
 
 # ---------------------------------------------------------------------------

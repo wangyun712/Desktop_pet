@@ -37,6 +37,7 @@ class AffectionSystem;
 class MainPanel;
 class AffectionPage;
 class SettingsPage;
+class DailyImagePage;
 
 class DesktopPet : public QWidget
 {
@@ -215,7 +216,8 @@ private:
     // ---------- 主面板 ----------
     // 注意 m_panel 是顶层窗口（没有 parent），所以必须在本类析构时手动 delete，
     // 否则它会活到进程结束才被系统回收。
-    MainPanel*     m_panel   = nullptr;
-    AffectionPage* m_affPage = nullptr;
-    SettingsPage*  m_setPage = nullptr;
+    MainPanel*     m_panel     = nullptr;
+    AffectionPage* m_affPage   = nullptr;
+    DailyImagePage* m_dailyPage = nullptr;
+    SettingsPage*  m_setPage   = nullptr;
 };

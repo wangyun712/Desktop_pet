@@ -431,8 +431,8 @@ QString AffectionSystem::describe() const
     QString s;
     s += QStringLiteral("好感度系统\r\n");
     s += QStringLiteral("  存档文件      : %1%2\r\n")
-             .arg(savePath())
-             .arg(m_persistent ? QString() : QStringLiteral("（本次不读写存档）"));
+             .arg(savePath(),
+                  m_persistent ? QString() : QStringLiteral("（本次不读写存档）"));
     s += QStringLiteral("  当前点数      : %1\r\n").arg(m_point, 0, 'f', 2);
     s += QStringLiteral("  等级 / 阶段   : Lv.%1 %2\r\n").arg(level()).arg(stageName());
     s += QStringLiteral("  本级进度      : %1 / %2（距 Lv.%3 还差 %4）\r\n")

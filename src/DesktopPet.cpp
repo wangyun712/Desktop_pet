@@ -5,6 +5,7 @@
 #include "MainPanel.h"
 #include "AffectionPage.h"
 #include "SettingsPage.h"
+#include "DailyImagePage.h"
 
 #include <QApplication>
 #include <QGuiApplication>
@@ -1389,6 +1390,12 @@ void DesktopPet::openPanel()
         });
 
         connect(m_affPage, &AffectionPage::chatRequested, this, &DesktopPet::noteChat);
+
+        // ---- 每日图片页 ----
+        // 没有信号要接：这页自己管"今天挑哪张图"和"双击开原图"，
+        // 桌宠这边不需要为它做任何事（不涉及好感度，也不播动画）。
+        m_dailyPage = new DailyImagePage(/*persistent=*/true, m_panel);
+        m_panel->addPage(QStringLiteral("每日图片"), m_dailyPage);
 
         // ---- 预留页（排在设置前面，和左侧导航的顺序一致）----
         m_panel->addPage(QStringLiteral("聊天"), makePlaceholderPage(QStringLiteral("聊天")));
