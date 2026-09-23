@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ============================================================================
+   resources.qrc —— Qt 资源系统清单
+
+   作用：告诉 Qt 把哪些图片「打包进 exe 内部」。
+   打包之后代码里用的路径长这样：  :/pet/01_行走_右脚前.png
+   开头那个 ":" 就表示"来自 exe 内部"，不是磁盘文件。
+
+   好处：
+     · 代码里不用写 E:\code\DesktopPet\... 这种绝对路径
+     · exe 拷到别的电脑上图片照样显示，不会丢
+     · 最终能打包成一个独立的 exe
+
+   ─────────────────────────────────────────────────────────────────────────
+   关于 alias（别名）—— 这是本文件唯一需要解释的地方：
+
+   磁盘上的文件名是 p01.png ~ p31.png（纯英文），
+   而 alias= 写的是中文名，程序里用的就是中文名：
+        <file alias="01_行走_右脚前.png">pet/p01.png</file>
+        ->  资源路径 = ":/pet/" + alias = ":/pet/01_行走_右脚前.png"
+
+   为什么要绕这一下？
+   因为 CMake 的 AUTORCC 在扫描 .qrc 时是按本地编码（GBK）解码的，
+   <file> 标签里只要出现中文，它就会把路径解坏，编译时报
+   "dependent 'E:\...\17_??png' does not exist"。
+   把 <file> 写成纯英文、中文名放进 alias，就完全绕开了这个坑，
+   而 alias 是交给 rcc 处理的，rcc 对 UTF-8 中文名支持得很好。
+
+   ─────────────────────────────────────────────────────────────────────────
+   新增或改名图片后：
+     1) 把文件放进 resources/pet/
+     2) 在这里加/改一行
+     3) 重新编译（.qrc 是编译期处理的，改完必须重新编译才生效）
+  ============================================================================
+-->
+<RCC>
+    <qresource prefix="/pet">
+        <!-- ── 行走素材（01~08）── -->
+        <file alias="01_行走_右脚前.png">pet/p01.png</file>
+        <file alias="02_行走_右脚中.png">pet/p02.png</file>
+        <file alias="03_行走_右脚后.png">pet/p03.png</file>
+        <file alias="04_行走_背面.png">pet/p04.png</file>
+        <file alias="05_行走_左脚前.png">pet/p05.png</file>
+        <file alias="06_行走_左脚中.png">pet/p06.png</file>
+        <file alias="07_行走_左脚后.png">pet/p07.png</file>
+        <file alias="08_站立.png">pet/p08.png</file>
+
+        <!-- ── 表情（09~12）── -->
+        <file alias="09_表情_开心.png">pet/p09.png</file>
+        <file alias="10_表情_委屈.png">pet/p10.png</file>
+        <file alias="11_表情_惊讶.png">pet/p11.png</file>
+        <file alias="12_表情_生气.png">pet/p12.png</file>
+
+        <!-- ── 其他动作（13~21）── -->
+        <file alias="13_打瞌睡_睡觉.png">pet/p13.png</file>
+        <file alias="14_坐下.png">pet/p14.png</file>
+        <file alias="15_挥手.png">pet/p15.png</file>
+        <file alias="16_思考.png">pet/p16.png</file>
+        <file alias="17_吃东西.png">pet/p17.png</file>
+        <file alias="18_喝水.png">pet/p18.png</file>
+        <file alias="19_生气跺脚.png">pet/p19.png</file>
+        <file alias="20_发呆.png">pet/p20.png</file>
+        <file alias="21_飞行.png">pet/p21.png</file>
+
+        <!-- ── 行走序列（22~29）──
+             8 帧「向右行走」，分三段播：起步(1) 播一次 -> 循环(2)~(6) 反复 -> 收步(7)(8) 播一次。
+             左向行走不单独出图，由 AnimationController 在运行时做水平镜像得到。
+             这 8 张已经统一缩放（角色高度对齐 p08 的 252px）并统一裁切成同一
+             尺寸 215x261，所以走路时窗口不需要 resize，帧间不会左右/上下跳。 -->
+        <file alias="22_行走_右01.png">pet/p22.png</file>
+        <file alias="23_行走_右02.png">pet/p23.png</file>
+        <file alias="24_行走_右03.png">pet/p24.png</file>
+        <file alias="25_行走_右04.png">pet/p25.png</file>
+        <file alias="26_行走_右05.png">pet/p26.png</file>
+        <file alias="27_行走_右06.png">pet/p27.png</file>
+        <file alias="28_行走_右07.png">pet/p28.png</file>
+        <file alias="29_行走_右08.png">pet/p29.png</file>
+
+        <!-- ── 拖拽（30）──
+             鼠标左键按住拖动时显示的一张图：角色被拎起来、双腿蜷着、头发往上飘。
+             已经统一处理：角色高 252（与 p08 同档）、画布 183x264。
+             ★ 画布比站立图(183x252)高 12px 是故意的 —— 角色底边距画布底边正好 12px，
+               窗口是按画布开的且底边锚点固定，所以拖动时角色在屏幕上会比站立时高 12px，
+               看起来就是"被拎离地面"。
+               这 12px 是烘在图片里的，想调要重新处理 resources/pet/p30.png。 -->
+        <file alias="30_拖拽.png">pet/p30.png</file>
+
+        <!-- ── 下落（31）──
+             松开鼠标后自由落体期间显示的一张图：张开双臂、蜷着腿、带汗滴和气流速度线。
+             ★ 规格必须和 p30 完全一致（画布 183x264、角色高 252、底边悬空 12px）★
+               两张图画布一样大 -> 从"拖拽"切到"下落"时窗口尺寸不变，一个像素都不抖。
+               落地时才收起那 12px 变成站立图，正好就是"脚落回地面"。 -->
+        <file alias="31_下落.png">pet/p31.png</file>
+    </qresource>
+</RCC>

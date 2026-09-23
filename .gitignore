@@ -1,0 +1,41 @@
+# ---- 构建产物（CMake / Ninja / JOM / MSVC）----
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeUserPresets.json
+*.ninja
+.ninja_deps
+.ninja_log
+Makefile
+qtcsettings.cmake
+
+# ---- 编译中间件与可执行文件 ----
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.d
+*.res
+*.tlog
+*.log
+
+# ---- IDE / 编辑器 ----
+.qtcreator/
+CMakeLists.txt.user*
+.vscode/
+.idea/
+*.autosave
+
+# ---- 工作区元数据（工作笔记 + 素材原始备份）----
+.workbuddy/
+
+# ---- 系统杂项 ----
+Thumbs.db
+Desktop.ini
+.DS_Store
