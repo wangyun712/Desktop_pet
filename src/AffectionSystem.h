@@ -56,7 +56,8 @@ public:
 
     int    petLeftToday() const;           // 今天还能摸几次
     int    feedLeftToday() const;          // 今天还能喂几次
-    int    chatLeftToday() const;          // 今天还能聊几次
+    int    chatLeftToday() const;          // 今天还能加几次"聊天"的分（★★ 不是能聊几次话 ★★
+                                           //   聊天本身不设次数限制，AFF_CHAT_PER_DAY 只卡加分）
     double todayGain() const { return m_todayGain; }
     double todayDecay() const { return m_todayDecay; }
     int    companyDays() const;            // 陪伴天数（含今天）

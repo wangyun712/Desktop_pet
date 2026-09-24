@@ -18,12 +18,17 @@
 #include <QDate>
 #include <QDebug>
 #include <QDir>
+#include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFile>
+#include <QKeyEvent>
 #include <QLabel>
+#include <QLineEdit>
 #include <QLocale>
 #include <QMessageBox>
 #include <QPainter>
 #include <QPixmap>
+#include <QPushButton>
 #include <QScreen>
 #include <QTextStream>
 #include <QTime>
@@ -34,6 +39,8 @@
 #include "AffectionPage.h"
 #include "SettingsPage.h"
 #include "DailyImagePage.h"
+#include "ChatPage.h"
+#include "SongLibrary.h"
 #include "MainPanel.h"
 
 // -----------------------------------------------------------------------------
@@ -51,7 +58,7 @@
 
 // -----------------------------------------------------------------------------
 //  --selftest：自检模式。不接事件循环，跑完就退出。
-//  会生成五个文件（都在 exe 同目录）：
+//  会生成下面这些文件（都在 exe 同目录）：
 //    petpal_selftest.txt          —— 这份 exe 的编译时间 + 全部图片的加载情况
 //                                    + 每个状态的帧序列 + 系统托盘状态与隐藏/恢复往返测试
 //                                    + 好感度的点数/等级/今日额度/存档路径
@@ -62,7 +69,7 @@
 //    petpal_selftest_panel.png    —— 主面板（左侧导航 + 好感度页）离屏渲染出来的样子
 //    petpal_selftest_daily.png    —— 主面板的「每日图片」页（今天随机到的那张）
 //    petpal_selftest_settings.png —— 主面板的「设置」页（重置好感度那张卡片）
-//    petpal_selftest_panel_max.png—— 主面板放大（铺满屏幕）之后的样子
+//    petpal_selftest_settings.png —— 主面板的「设置」页（重置好感度那张卡片）
 //    petpal_selftest_confirm.png  —— 重置前弹出的确认框（验证默认按钮落在「取消」上）
 //
 //  用法：PetPal.exe --selftest
@@ -568,6 +575,17 @@ static int runSelfTest()
                 ts << QStringLiteral("\r\n--- 每日图片（主面板那一页）---\r\n");
                 ts << DailyImagePage::describeDailyImage();
 
+                // 聊天：台词全部编译进 exe，所以"有多少句、什么时候用哪一句"
+                // 是唯一值得看的东西。这一节顺带用真实输入跑一遍匹配 ——
+                // 光看"意图 18 条"是看不出匹配逻辑对不对的。
+                ts << QStringLiteral("\r\n--- 聊天（预设台词，不联网、不接大模型）---\r\n");
+                ts << ChatPage::describeChat();
+
+                // 曲库：歌和词都在磁盘上的 resources/songs/*.txt 里（不在 exe 里，
+                // 也不在 .qrc 里）。这一节说明"目录找没找到、有几首歌、点歌会唱什么"。
+                ts << QStringLiteral("\r\n--- 曲库（resources/songs/*.txt）---\r\n");
+                ts << SongLibrary::describeLibrary();
+
                 ts.flush();
                 f.close();
             }
@@ -640,7 +658,10 @@ static int runSelfTest()
             panel.addPage(QStringLiteral("好感度"),   new AffectionPage(pet.affection(), &panel));
             // 只读模式：自检不该把用户当天的图重新抽一遍
             panel.addPage(QStringLiteral("每日图片"), new DailyImagePage(/*persistent=*/false, &panel));
-            panel.addPage(QStringLiteral("聊天"),     new QLabel(QStringLiteral("这一页还没做，先把位置占住"), &panel));
+            // 聊天页也是只读用法：它的 showEvent 会发 chatEntered()，但自检这边
+            // 没有把它接到 noteChat() 上，所以不会替用户加好感度、也不会写存档。
+            auto* chatPage = new ChatPage(pet.affection(), &panel);
+            panel.addPage(QStringLiteral("聊天"),     chatPage);
             panel.addPage(QStringLiteral("设置"),     new SettingsPage(pet.affection(), &panel));
             panel.show();
             QApplication::processEvents();
@@ -666,6 +687,44 @@ static int runSelfTest()
             panel.setCurrentPage(1);
             QApplication::processEvents();
             shoot(QStringLiteral("petpal_selftest_daily.png"));
+
+            // 「聊天」：这一页有两个只能看图看出来的东西 —— 左右两边的气泡样式
+            //（天依在左、用户在右），以及输入行有没有排到窗口外面去。
+            //
+            // ★ 这里不是摆拍 ★：先等开场白打完（打字机 45ms/字，得给它真实时间跑），
+            //   再往输入框里塞一句话、发一个真的回车事件。走的是和用户手打完全相同的
+            //   那条路径（returnPressed -> onSend -> matchIntent -> Picker），
+            //   所以截图里的那一问一答就是程序真跑出来的。
+            panel.setCurrentPage(2);
+            QApplication::processEvents();
+            {
+                const auto pump = [](int ms) {
+                    QElapsedTimer t;
+                    t.start();
+                    while (t.elapsed() < ms)
+                        QApplication::processEvents(QEventLoop::AllEvents, 20);
+                };
+
+                // 「说完了没有」不用猜秒数 —— 打字机放话期间发送键是禁用的，
+                // 直接拿它当信号。开场白有长有短（最长那句要三秒多），
+                // 猜一个固定值是猜不准的：改成固定等 900ms 时，截图里那句
+                // 开场白正好被打断在半句话上。
+                QPushButton* sendBtn = chatPage->findChild<QPushButton*>(QStringLiteral("send"));
+                for (int i = 0; i < 100 && sendBtn && !sendBtn->isEnabled(); ++i)
+                    pump(100);          // 上限 10 秒，纯属防呆
+
+                if (QLineEdit* input = chatPage->findChild<QLineEdit*>())
+                {
+                    input->setText(QStringLiteral("你今天唱首歌给我听好不好"));
+                    QKeyEvent press(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+                    QCoreApplication::sendEvent(input, &press);
+                }
+
+                // 用户那句是立刻上屏的，天依的回复则在逐字放 —— 等它放完
+                for (int i = 0; i < 100 && sendBtn && !sendBtn->isEnabled(); ++i)
+                    pump(100);
+            }
+            shoot(QStringLiteral("petpal_selftest_chat.png"));
 
             // 「设置」页：重置按钮和那张卡片是纯样式表堆出来的，排错行只能看图。
             panel.setCurrentPage(3);

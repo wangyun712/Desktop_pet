@@ -68,6 +68,10 @@ set(PROJECT_SOURCES
     src/SettingsPage.cpp
     src/DailyImagePage.h
     src/DailyImagePage.cpp
+    src/ChatScript.h
+    src/SongLibrary.h
+    src/ChatPage.h
+    src/ChatPage.cpp
 )
 
 set(PROJECT_RESOURCES
@@ -135,6 +139,9 @@ set(PETPAL_HEADERS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/AffectionPage.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/SettingsPage.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/DailyImagePage.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ChatScript.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/SongLibrary.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ChatPage.h"
 )
 
 set_property(SOURCE
@@ -147,6 +154,7 @@ set_property(SOURCE
     src/AffectionPage.cpp
     src/SettingsPage.cpp
     src/DailyImagePage.cpp
+    src/ChatPage.cpp
     APPEND PROPERTY OBJECT_DEPENDS ${PETPAL_HEADERS}
 )
 

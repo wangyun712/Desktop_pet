@@ -35,6 +35,7 @@ class AnimationController;
 class PetBehaviorController;
 class AffectionSystem;
 class MainPanel;
+class ChatPage;
 class AffectionPage;
 class SettingsPage;
 class DailyImagePage;
@@ -219,5 +220,6 @@ private:
     MainPanel*     m_panel     = nullptr;
     AffectionPage* m_affPage   = nullptr;
     DailyImagePage* m_dailyPage = nullptr;
+    ChatPage*      m_chatPage  = nullptr;
     SettingsPage*  m_setPage   = nullptr;
 };

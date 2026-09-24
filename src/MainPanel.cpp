@@ -188,6 +188,11 @@ void MainPanel::setCurrentPage(int index)
         m_nav->setCurrentRow(index);   // 导航选中会联动右侧 stack
 }
 
+int MainPanel::indexOfPage(QWidget* page) const
+{
+    return m_stack ? m_stack->indexOf(page) : -1;   // 没加过这页时是 -1
+}
+
 // =============================================================================
 //  居中显示
 // =============================================================================

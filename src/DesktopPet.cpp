@@ -6,6 +6,7 @@
 #include "AffectionPage.h"
 #include "SettingsPage.h"
 #include "DailyImagePage.h"
+#include "ChatPage.h"
 
 #include <QApplication>
 #include <QGuiApplication>
@@ -1017,11 +1018,19 @@ void DesktopPet::buildMenu()
     title->setEnabled(false);       // 只是个标题，不可点
     m_menu->addSeparator();
 
-    // ---- 和我聊天：第一阶段只发信号，预留给本地 Qwen ----
+    // ---- 和我聊天：直接翻到聊天页 ----
+    // 加分不在这里做 —— 切到聊天页本身就会触发一次 noteChat()（见 ChatPage::showEvent），
+    // 这里再记一笔就成了"点一次加两次"。所以这一项在下面的 QMenu::triggered 里
+    // 也是被排除掉的。
     m_menu->addAction(QStringLiteral("和我聊天"), this, [this]()
     {
         m_behavior->notifyUserInteraction();
-        noteChat();
+        openPanel();
+        if (m_panel && m_chatPage)
+        {
+            m_panel->setCurrentPage(m_panel->indexOfPage(m_chatPage));
+            m_chatPage->focusInput();
+        }
     });
 
     // ---- 打开面板：右侧弹出一个主面板（左侧是功能导航）----
@@ -1132,8 +1141,9 @@ void DesktopPet::buildMenu()
     //
     //   代价是得把"不算互动"的几项排除掉，分两类：
     //     · 系统项（暂停 / 恢复 / 隐藏）：它们只改程序状态，不是陪它玩
-    //     · 入口项（和我聊天 / 打开面板）和退出：各有各的加分逻辑（聊天 +3），
-    //       或者根本不该算（退出）
+    //     · 入口项（和我聊天 / 打开面板）和退出："和我聊天"的加分走的是
+    //       "切到聊天页 -> noteChat()"那条路（和面板里点进去同一个入口，只加一次），
+    //       这里再记一笔会变成一次点击加两份；退出则根本不该算。
     connect(m_menu, &QMenu::triggered, this, [this](QAction* a) {
         if (!a || a == m_actPause || a == m_actResume || a == m_actHide)
             return;
@@ -1345,23 +1355,12 @@ QString DesktopPet::debugTrayRoundTrip()
 
 // =============================================================================
 //  主面板
+//
+//  加新功能页只要写一个 QWidget，然后 m_panel->addPage("标题", page) ——
+//  左侧导航会自动多一项、右侧自动多一页，这里的布局代码一行都不用动。
+//  （原先这里有个 makePlaceholderPage() 给"聊天"占位，聊天页做出来之后就删了。
+//    再加页不需要占位函数，MainPanel 的 addPage 本身就是那个接口。）
 // =============================================================================
-
-// 还没做的功能页：一句说明文字占个位置。
-// 留着它是为了让左侧导航一开始就是"一个功能列表"的样子 —— 加新页时，
-// 只要写一个 QWidget 调 addPage()，布局代码一行都不用动。
-static QWidget* makePlaceholderPage(const QString& title)
-{
-    auto* page = new QWidget;
-    auto* v = new QVBoxLayout(page);
-    v->setContentsMargins(20, 16, 20, 16);
-
-    auto* lab = new QLabel(QStringLiteral("%1\n\n这一页还没做，先把位置占住").arg(title), page);
-    lab->setAlignment(Qt::AlignCenter);
-    lab->setStyleSheet(QStringLiteral("color: #B4B2A9; font-size: 13px;"));
-    v->addWidget(lab);
-    return page;
-}
 
 void DesktopPet::openPanel()
 {
@@ -1397,8 +1396,33 @@ void DesktopPet::openPanel()
         m_dailyPage = new DailyImagePage(/*persistent=*/true, m_panel);
         m_panel->addPage(QStringLiteral("每日图片"), m_dailyPage);
 
-        // ---- 预留页（排在设置前面，和左侧导航的顺序一致）----
-        m_panel->addPage(QStringLiteral("聊天"), makePlaceholderPage(QStringLiteral("聊天")));
+        // ---- 聊天页（洛天依，预设台词，不联网）----
+        // ★ 页面只发信号，不碰好感度、不碰桌宠状态 ★
+        //  加分和播动作必须成对发生，所以两件事都写在这一个地方（和摸摸/喂食同一个规矩）。
+        m_chatPage = new ChatPage(m_affection, m_panel);
+        m_panel->addPage(QStringLiteral("聊天"), m_chatPage);
+
+        // 每次切到聊天页 = 一次聊天。聊多少句都不再额外加分，
+        // 所以反复说话刷不到分（额度是每日 AFF_CHAT_PER_DAY 次）。
+        connect(m_chatPage, &ChatPage::chatEntered, this, &DesktopPet::noteChat);
+
+        // 这句回复带着什么情绪，就播什么动作。
+        // Neutral / Thinking 不切动作：闲聊时突然换个表情，反而像是被打断，
+        // 而且大部分回复本来就该让它继续做自己的事。
+        connect(m_chatPage, &ChatPage::moodChanged, this, [this](ChatScript::Mood mood) {
+            if (m_dragging || isFalling())
+                return;      // 正被拎着 / 正在下落，别打断画面（和升级那一条同一个理由）
+
+            PetState s = PetState::Idle;
+            switch (mood)
+            {
+            case ChatScript::Mood::Happy: s = PetState::Happy;    break;
+            case ChatScript::Mood::Shy:   s = PetState::Surprise; break;  // 没有专用害羞帧，用惊讶顶一下
+            case ChatScript::Mood::Sad:   s = PetState::Sad;      break;
+            default:                      return;                          // Neutral / Thinking：不切
+            }
+            runChain(QVector<PetState>{ s });
+        });
 
         // ---- 设置页 ----
         // 弹窗确认已经在页面里做完了（那是界面自己的事），这里收到的信号
@@ -1427,8 +1451,10 @@ void DesktopPet::closePanel()
 
 void DesktopPet::noteChat()
 {
-    // 先记一笔好感度，再交出去。
-    // 第一阶段没人接这个信号（只打日志），但分照记 —— 以后接上 Qwen 就不用回头补。
+    // 先记一笔好感度（每日上限 AFF_CHAT_PER_DAY 次），再交出去。
+    // 谁调它：切到聊天页（ChatPage::showEvent）、好感度页那个"和我聊聊"按钮。
+    // ★ 加分和"播什么动作"是两回事：这里只管加分。桌宠摆什么表情由
+    //   ChatPage::moodChanged 那条连接决定 —— 用户点进来时它甚至可能正在睡觉。
     m_affection->addSource(AffectionSystem::Source::Chat, PetCfg::AFF_CHAT_POINT);
     emit chatRequested();
 }

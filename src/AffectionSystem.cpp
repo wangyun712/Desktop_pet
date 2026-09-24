@@ -142,8 +142,7 @@ double AffectionSystem::addSource(Source s, double amount, int cooldownMs)
 {
     checkNewDay();
 
-    // 冷却只对"需要限流"的来源生效（拖动、菜单动作）。聊天和陪伴不设冷却。
-    checkNewDay();
+    // 冷却只对"需要限流"的来源生效（拖动、菜单动作）。聊天不设冷却。
     if (cooldownMs > 0)
     {
         const qint64 now = nowMs();
@@ -159,12 +158,19 @@ double AffectionSystem::addSource(Source s, double amount, int cooldownMs)
             *slot = now;
         }
     }
-    if(m_chatUsed < PetCfg::AFF_CHAT_PER_DAY)
+
+    // ★ 每日次数上限只针对"聊天"这一种来源 ★
+    //   以前这里不分来源，谁来都先吃掉一次聊天额度 —— 于是拖拽（+1）和
+    //   菜单动作（+2）也把聊天次数耗掉。症状很隐蔽：一天拖过 5 次之后，
+    //   聊天页不再加分、玩耍也不再加分，但两边都不报错、按钮也不变灰。
+    if (s == Source::Chat)
     {
-        m_chatUsed++;
-        return gain(amount, /*countInteraction=*/true);
+        if (m_chatUsed >= PetCfg::AFF_CHAT_PER_DAY)
+            return 0.0;             // 今天的聊天额度用完了
+        ++m_chatUsed;
     }
-    else return 0.0;
+
+    return gain(amount, /*countInteraction=*/true);
 }
 
 double AffectionSystem::gain(double amount, bool countInteraction)

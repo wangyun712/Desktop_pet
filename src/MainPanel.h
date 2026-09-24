@@ -34,6 +34,10 @@ public:
     // 给 --selftest 用：它要把每一页都离屏渲染一张，得能一页页翻过去。
     void setCurrentPage(int index);
 
+    // 某个页面排在第几页。加页顺序一变，硬编码的下标就会指错页，
+    // 所以"跳到聊天页"这种需求一律走这个函数，不写数字。
+    int  indexOfPage(QWidget* page) const;
+
     // 在指定屏幕可用区里居中显示。传进来而不是自己算，
     // 是为了让面板跟着"桌宠在哪块屏幕"走 —— 多显示器时这一点很重要。
     void showCenteredIn(const QRect& screenRect);
