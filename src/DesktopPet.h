@@ -36,6 +36,7 @@ class PetBehaviorController;
 class AffectionSystem;
 class MainPanel;
 class ChatPage;
+class PlayerPage;
 class AffectionPage;
 class SettingsPage;
 class DailyImagePage;
@@ -87,6 +88,14 @@ public:
     // "回来以后顿一下""回来不走路了""明明暂停了却自己动起来"这类怪现象。
     QString debugTrayRoundTrip();
 
+    // 【只给 --selftest 用】读 Windows **实际**的 WS_EX_TOPMOST 位。
+    //
+    // 为什么不能拿 windowFlags().testFlag(Qt::WindowStaysOnTopHint) 代替：
+    // 那个读的是 Qt 自己记着的"意图"，和系统窗口上真实的那一位**可以不一致** ——
+    // 这个 bug 的症状恰好就是"Qt 还说自己是置顶，系统那一位早被摘了"。
+    // 非 Windows 平台上恒返回 true（那边没有这种问题）。
+    bool reallyOnTop() const;
+
 signals:
     // 「和我聊天」的接口。
     // 第一阶段只把信号发出去，不接 AI。以后接本地 Qwen 时，
@@ -94,6 +103,9 @@ signals:
     void chatRequested();
 
 protected:
+    // 每次窗口重新变得可见（启动、从状态栏恢复、被系统重新显示）都会走这里。
+    // 它只做一件事：把"始终置顶"重新钉一遍（原因见 .cpp 里 ensureOnTop 的说明）。
+    void showEvent(QShowEvent* event) override;
     void paintEvent(QPaintEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
@@ -115,6 +127,10 @@ private slots:
 private:
     // ---------- 窗口 ----------
     void  setupWindow();
+    // 把 Qt::WindowStaysOnTopHint 对应到系统上的 WS_EX_TOPMOST 位**重新钉一遍**。
+    // 为什么需要它：Windows 会在 Qt 不知情的时候把这一位摘掉（隐藏后再显示、
+    // 别的顶层窗口开开关关），摘掉之后桌宠就会被普通窗口盖住。详见 .cpp。
+    void  ensureOnTop();
     void  resizeWindowForState(PetState s);
     QPoint anchorScreenPos() const;                      // 角色脚底中心在屏幕上的位置
     QPoint frameTopLeft(const QPixmap& pm) const;        // 当前帧在窗口里的左上角
@@ -142,6 +158,9 @@ private:
     void turnTo(int newDir);
     void onHitEdge();
     void tickMovement(double dt);
+    // 把窗口挪到 m_pos 对应的整数位置（位置取整后没变就什么都不做）。
+    // 为什么要有它：见 .cpp 里的说明 —— 分层窗口的每一次 move() 都要整块重合成。
+    void applyWindowPos();
     // allowTurn = false 时不触发"撞边掉头"。
     // 调整窗口大小、拖动这类操作也会调用钳位，但它们不该让桌宠转身，
     // 而且禁掉转身还能避免"尺寸变化 -> 钳位 -> 转身 -> 状态变化 -> 再改尺寸"这种重入。
@@ -221,5 +240,6 @@ private:
     AffectionPage* m_affPage   = nullptr;
     DailyImagePage* m_dailyPage = nullptr;
     ChatPage*      m_chatPage  = nullptr;
+    PlayerPage*    m_playerPage = nullptr;
     SettingsPage*  m_setPage   = nullptr;
 };

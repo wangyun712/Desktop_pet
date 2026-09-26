@@ -1,4 +1,5 @@
 #include "AffectionPage.h"
+#include "UiFont.h"
 #include "AffectionSystem.h"
 #include "PetConfig.h"
 
@@ -161,7 +162,7 @@ QWidget* AffectionPage::buildMetric(const QString& caption, QLabel** valueOut)
 // =============================================================================
 void AffectionPage::applyStyle()
 {
-    setStyleSheet(QStringLiteral(R"(
+    setStyleSheet(UiFont::styleSheet(QStringLiteral(R"(
         QLabel#avatar   { background: #F1EFE8; border-radius: 8px; }
         QLabel#name     { color: #2C2C2A; font-size: 15px; font-weight: 500; }
         QLabel#level    { color: #5F5E5A; font-size: 13px; }
@@ -185,7 +186,14 @@ void AffectionPage::applyStyle()
             border-radius: 8px; padding: 7px 16px; font-size: 13px;
         }
         QPushButton#actGhost:hover { background: #EEEDFE; }
-    )"));
+    )")));
+}
+
+// 界面字号档位变了：重套一遍样式表。数字部分不用管 —— 布局会自己重排。
+void AffectionPage::applyUiScale()
+{
+    applyStyle();
+    refresh();
 }
 
 // =============================================================================

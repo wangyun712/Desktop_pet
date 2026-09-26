@@ -52,6 +52,9 @@ public:
     // 不该让人再点一下输入框（面板上点进这一页则不需要，那种情况下用户还在看界面）。
     void focusInput();
 
+    // 界面字号档位变了之后重新套样式表（见 UiFont.h）
+    void applyUiScale();
+
 signals:
     void chatEntered();                      // 切到这一页 —— DesktopPet 据此记一次聊天
     void moodChanged(ChatScript::Mood mood); // 这句回复的情绪 —— DesktopPet 据此播动作
@@ -70,6 +73,7 @@ private:
     void     startTyping(QLabel* label, const QString& text);
     void     scrollToBottom();
     void     refreshHeader();
+    void     applyStyle();              // 整页样式表（构造时和改字号时共用）
 
     int      bubbleMaxWidth() const;    // 气泡宽度上限 —— 跟着消息区宽度变
     void     applyBubbleWidths();       // 把新上限刷到已经造出来的气泡上

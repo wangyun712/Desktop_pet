@@ -41,7 +41,10 @@
 #include "DailyImagePage.h"
 #include "ChatPage.h"
 #include "SongLibrary.h"
+#include "PlayerPage.h"
+#include "MusicLibrary.h"
 #include "MainPanel.h"
+#include "UiFont.h"
 
 // -----------------------------------------------------------------------------
 //  --walktrace：把行走的播放顺序逐帧打出来。
@@ -69,7 +72,8 @@
 //    petpal_selftest_panel.png    —— 主面板（左侧导航 + 好感度页）离屏渲染出来的样子
 //    petpal_selftest_daily.png    —— 主面板的「每日图片」页（今天随机到的那张）
 //    petpal_selftest_settings.png —— 主面板的「设置」页（重置好感度那张卡片）
-//    petpal_selftest_settings.png —— 主面板的「设置」页（重置好感度那张卡片）
+//    petpal_selftest_player_empty.png —— 「播放器」页的空态（还没选文件夹）
+//    petpal_selftest_player.png   —— 「播放器」页塞了假曲目之后的样子（列表 + 歌词 + 播放条）
 //    petpal_selftest_confirm.png  —— 重置前弹出的确认框（验证默认按钮落在「取消」上）
 //
 //  用法：PetPal.exe --selftest
@@ -586,6 +590,18 @@ static int runSelfTest()
                 ts << QStringLiteral("\r\n--- 曲库（resources/songs/*.txt）---\r\n");
                 ts << SongLibrary::describeLibrary();
 
+                // 播放器：标签解析、后台线程扫描、搜索索引 —— 这三样都属于
+                // "不跑一遍就不知道对不对"的东西，所以现场拼样本文件跑。
+                // 详见 PlayerPage::describePlayer() 里的分段说明。
+                ts << QStringLiteral("\r\n--- 播放器（选文件夹 / 列表 / 歌词 / 进度条）---\r\n");
+                ts << PlayerPage::describePlayer();
+
+                // 界面字号：这是"调一次、以后每次启动都按它来"的首选项，
+                // 所以报告里要写清"这次读到的是多少、存在哪个文件" ——
+                // 只写一句"字号偏好已加载"看不出它到底是在读还是在瞎猜。
+                ts << QStringLiteral("\r\n--- 界面字号（设置页那个滑条 · 首选项）---\r\n");
+                ts << UiFont::describe();
+
                 ts.flush();
                 f.close();
             }
@@ -655,16 +671,70 @@ static int runSelfTest()
         {
             MainPanel panel;
             panel.setAttribute(Qt::WA_DontShowOnScreen, true);
-            panel.addPage(QStringLiteral("好感度"),   new AffectionPage(pet.affection(), &panel));
+
+            // ★ 每页都留一个指针 ★
+            //   下面要"翻到某一页"时一律用 panel.indexOfPage(那一页)，
+            //   绝不写死数字 —— 加了一页（比如这次的播放器）下标就全错位了。
+            auto* affPage    = new AffectionPage(pet.affection(), &panel);
             // 只读模式：自检不该把用户当天的图重新抽一遍
-            panel.addPage(QStringLiteral("每日图片"), new DailyImagePage(/*persistent=*/false, &panel));
+            auto* dailyPage  = new DailyImagePage(/*persistent=*/false, &panel);
             // 聊天页也是只读用法：它的 showEvent 会发 chatEntered()，但自检这边
             // 没有把它接到 noteChat() 上，所以不会替用户加好感度、也不会写存档。
-            auto* chatPage = new ChatPage(pet.affection(), &panel);
+            auto* chatPage   = new ChatPage(pet.affection(), &panel);
+            auto* playerPage = new PlayerPage(&panel);
+            auto* setPage    = new SettingsPage(pet.affection(), &panel);
+
+            panel.addPage(QStringLiteral("好感度"),   affPage);
+            panel.addPage(QStringLiteral("每日图片"), dailyPage);
             panel.addPage(QStringLiteral("聊天"),     chatPage);
-            panel.addPage(QStringLiteral("设置"),     new SettingsPage(pet.affection(), &panel));
+            panel.addPage(QStringLiteral("播放器"),   playerPage);
+            panel.addPage(QStringLiteral("设置"),     setPage);
             panel.show();
             QApplication::processEvents();
+
+            // ---------- 窗口层级（谁该压着谁）----------
+            // 用户明定的分工：桌宠本体置顶（永远压在所有窗口、包括本面板上面），
+            // 主面板是普通窗口（该被别的程序盖住就盖住）。
+            // ★ 这件事在截图上一点都看不出来 ★ —— 全凭 windowFlags 里一个 bit 决定，
+            //   要验证只能"手动点一下别的窗口看面板会不会让开"。所以按这个项目里
+            //   "看不见的功能要写进报告"的惯例，把两个窗口的实际层级印出来：
+            //   以后谁顺手给面板加回 WindowStaysOnTopHint，这里立刻变成 [!!]。
+            {
+                const bool petTop   = pet.windowFlags().testFlag(Qt::WindowStaysOnTopHint);
+                const bool panelTop = panel.windowFlags().testFlag(Qt::WindowStaysOnTopHint);
+
+                // ★ 意图 ≠ 事实 ★
+                //   windowFlags() 读的是 Qt 自己那份"打算"，而系统上真实的那一位
+                //   可能早被 Windows 摘掉了 —— 用户报的"开一次面板再关掉，桌宠就被
+                //   别的窗口盖住"正是这种情况：Qt 依然坚持自己是置顶，画面却不对。
+                //   所以额外把系统实际的值读出来。两者不一致就说明又踩到这个坑了。
+                const bool petRealTop = pet.reallyOnTop();
+
+                QFile f(exeDir.filePath(QStringLiteral("petpal_selftest.txt")));
+                if (f.open(QIODevice::Append | QIODevice::Text))
+                {
+                    QTextStream ts(&f);
+                    ts.setEncoding(QStringConverter::Utf8);
+                    ts << QStringLiteral("\r\n--- 窗口层级 ---\r\n");
+                    ts << QStringLiteral("桌宠本体 : %1  ->  %2\r\n")
+                              .arg(petTop ? QStringLiteral("置顶")
+                                          : QStringLiteral("普通窗口"))
+                              .arg(petTop ? QStringLiteral("[OK] 永远压在所有窗口上面")
+                                          : QStringLiteral("[!!] 桌宠必须置顶"));
+                    ts << QStringLiteral("主面板   : %1  ->  %2\r\n")
+                              .arg(panelTop ? QStringLiteral("置顶")
+                                            : QStringLiteral("普通窗口"))
+                              .arg(panelTop ? QStringLiteral("[!!] 面板不该置顶 —— 别的窗口盖不住它")
+                                            : QStringLiteral("[OK] 可以被别的窗口盖住"));
+                    ts << QStringLiteral("系统实际位 : 桌宠 %1  ->  %2\r\n")
+                              .arg(petRealTop ? QStringLiteral("WS_EX_TOPMOST 在位")
+                                              : QStringLiteral("WS_EX_TOPMOST 缺失"))
+                              .arg(petRealTop ? QStringLiteral("[OK] 系统上确实钉住了")
+                                              : QStringLiteral("[!!] Qt 说置顶但系统没钉住 —— 检查 ensureOnTop"));
+                    ts.flush();
+                    f.close();
+                }
+            }
 
             // 面板本身是圆角透明的，直接存会是一张"四周全透明"的图，看不清楚边界，
             // 所以垫一层浅灰底，再把面板 1:1 画上去。
@@ -684,7 +754,7 @@ static int runSelfTest()
 
             // 「每日图片」：这一页的成败全看"图有没有等比放进框里、有没有被拉变形"，
             // 报告里写多少句都不如一张图。
-            panel.setCurrentPage(1);
+            panel.setCurrentPage(panel.indexOfPage(dailyPage));
             QApplication::processEvents();
             shoot(QStringLiteral("petpal_selftest_daily.png"));
 
@@ -695,7 +765,7 @@ static int runSelfTest()
             //   再往输入框里塞一句话、发一个真的回车事件。走的是和用户手打完全相同的
             //   那条路径（returnPressed -> onSend -> matchIntent -> Picker），
             //   所以截图里的那一问一答就是程序真跑出来的。
-            panel.setCurrentPage(2);
+            panel.setCurrentPage(panel.indexOfPage(chatPage));
             QApplication::processEvents();
             {
                 const auto pump = [](int ms) {
@@ -726,15 +796,52 @@ static int runSelfTest()
             }
             shoot(QStringLiteral("petpal_selftest_chat.png"));
 
+            // 「播放器」：这一页有两张 —— 先是空态（还没选文件夹），再塞几首假曲目
+            // 进去拍"有歌的样子"。两张都要，因为空态和满态的排版问题完全不同
+            //（空态容易把播放条顶到中间，满态容易把列表挤扁）。
+            //
+            // ★ 注入走的是 MusicLibrary 的正式入口（appendBatch），不是摆拍 ★
+            //   所以截图里的列表、计数、搜索都是真实那条路跑出来的。
+            panel.setCurrentPage(panel.indexOfPage(playerPage));
+            QApplication::processEvents();
+            shoot(QStringLiteral("petpal_selftest_player_empty.png"));
+
+            {
+                QVector<Track> demo;
+                const auto add = [&demo](const char* title, const char* artist,
+                                         int sec, bool cover, bool lyrics) {
+                    Track t;
+                    t.path       = QStringLiteral("(自检假数据)") + QString::fromUtf8(title)
+                                   + QStringLiteral(".mp3");
+                    t.title      = QString::fromUtf8(title);
+                    t.artist     = QString::fromUtf8(artist);
+                    t.durationMs = sec * 1000;
+                    t.hasCover   = cover;
+                    t.hasLyrics  = lyrics;
+                    demo.append(t);
+                };
+                add("世末歌者",     "洛天依",       245, true,  true);
+                add("霜雪千年",     "乐正绫 / 洛天依", 262, true,  true);
+                add("晴天",         "周杰伦",       269, false, true);
+                add("海阔天空",     "Beyond",       326, false, false);
+                add("达拉崩吧",     "洛天依",       197, false, true);
+                add("权御天下",     "洛天依",       201, false, false);
+                add("以父之名",     "周杰伦",       342, false, false);
+                add("真的爱你",     "Beyond",       268, false, false);
+                playerPage->debugInjectTracks(demo);
+            }
+            QApplication::processEvents();
+            shoot(QStringLiteral("petpal_selftest_player.png"));
+
             // 「设置」页：重置按钮和那张卡片是纯样式表堆出来的，排错行只能看图。
-            panel.setCurrentPage(3);
+            panel.setCurrentPage(panel.indexOfPage(setPage));
             QApplication::processEvents();
             shoot(QStringLiteral("petpal_selftest_settings.png"));
 
             // 放大状态：三处只有看图才知道对不对 —— 圆角有没有变成直角
             //（留着圆角的话铺满屏幕时四角会各透出一块桌面）、放大按钮有没有换成"还原"图标、
             // 顶部条那三个按钮在铺满之后是不是还老老实实靠右。
-            panel.setCurrentPage(0);
+            panel.setCurrentPage(panel.indexOfPage(affPage));
             panel.toggleMaximized();
             QApplication::processEvents();
             shoot(QStringLiteral("petpal_selftest_panel_max.png"));
@@ -773,6 +880,15 @@ int main(int argc, char* argv[])
     // QApplication 必须先于任何 QWidget 构造
     QApplication app(argc, argv);
     QCoreApplication::setApplicationName(QStringLiteral("PetPal"));
+
+    // 读入用户上次在设置页调好的"界面字号"（首选项，存在 %APPDATA%/PetPal/ui.ini）。
+    // 这里负责其中一半：把档位应用到全局默认字体；另一半在 UiFont::styleSheet() 里 ——
+    // 各页面构造时套样式表会经过它，QSS 里写死的字号同样按档位改写。
+    // ★ 必须在建任何窗口之前调 ★
+    //   它改的是 QApplication 的默认字体，只有"之后创建"的控件才会继承；
+    //   面板是懒加载的（点了才建），所以正常跑起来其实也来得及，
+    //   但自检里那些窗口是紧接着建的，放这里最稳妥、也最好理解。
+    UiFont::applyToApplication();
 
     // 自检模式：跑完就退出，不进入事件循环
     if (QCoreApplication::arguments().contains(QStringLiteral("--selftest")))
@@ -823,7 +939,7 @@ int main(int argc, char* argv[])
     //   3) 按回答内容让桌宠播 Think / Happy / Sad / Surprise / Angry
     QObject::connect(&pet, &DesktopPet::chatRequested, &pet, []()
     {
-        qInfo() << "[PetPal] 收到聊天请求 —— 这里就是接入本地 Qwen 的位置。";
+        qInfo() << "[PetPal] 收到聊天请求。";
     });
 
     pet.start();

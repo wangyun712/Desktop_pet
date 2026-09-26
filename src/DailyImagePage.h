@@ -37,6 +37,7 @@
 
 class QLabel;
 class QPushButton;
+class QTimer;
 
 class DailyImagePage : public QWidget
 {
@@ -46,6 +47,9 @@ public:
     // 自检会离屏渲染这一页，如果照常写，"今天该显示哪张图"会被自检重新抽一次，
     // 等于替用户把当天的图定了 —— 和 AffectionSystem(false) 是同一个道理。
     explicit DailyImagePage(bool persistent = true, QWidget* parent = nullptr);
+
+    // 界面字号档位变了之后重新套样式表（见 UiFont.h）
+    void applyUiScale();
 
     // 检查"今天该显示哪张"。由 showEvent 调用（切到这一页 / 重新打开面板时都会走）。
     // 同一天里反复调用不会换图 —— 换不换由日期决定，不由调用次数决定。
@@ -66,13 +70,17 @@ private slots:
     void onShuffle();               // 「换一换」：随机换一张，并把结果记进存档
 
 private:
+    void           applyStyle();            // 整页样式表（构造时和改字号时共用）
     QString        pickTodayImage();        // 今天的图（今天已经挑过就沿用，否则随机）
     QString        pickUnseen(const QStringList& files, const QString& currentName);
                                             // ★ 挑图唯一入口：优先给"本次还没看过"的
     QStringList    scanImages() const;      // 扫 daily_image 目录
     static QString findDailyImageDir();     // 找 daily_image 在哪（见 .cpp 里的说明）
     void           applyImage(const QString& path);
-    void           rescaleImage();          // 按当前可用区域重新等比缩放
+    // 按当前可用区域重新等比缩放。
+    //   smooth=false 走最近邻（几毫秒，拖动窗口时用来保持跟手），
+    //   smooth=true 走平滑（最终成品，由 m_rescaleTimer 在停手后触发）。
+    void           rescaleImage(bool smooth = true);
     QString        captionText() const;     // 底部那行：文件名 / 原图尺寸 / 双击提示
     void           updateProgressLabel();   // 标题行：本次还剩 N 张没看过
 
@@ -83,7 +91,15 @@ private:
 
     QString m_dir;           // daily_image 的绝对路径（找不到时为空）
     QString m_currentPath;   // 当前这张图的绝对路径
-    QPixmap m_source;        // 原图缓存（resize 时重新缩放用它，避免反复解码）
+    // ★ m_source 是"够用"的那一版，不一定是原图 ★
+    //   用户的插画动辄几千像素（本机实测有 7000px 的）。每换一次窗口大小就从原图
+    //   平滑缩一次是"目标像素数 × 缩放倍数"级别的开销，而窗口一变就会连着来
+    //   几十上百次 —— 面板就卡住了。所以载入后先按"屏幕的最大物理尺寸"降采样一次
+    //   （面板最多也就铺满屏幕，再清晰也没地方显示），之后所有缩放都从这份出发。
+    //   原图尺寸单独记在 m_sourceSize 里，给底部那行文字用。
+    QPixmap m_source;        // 显示用的缓存（可能已降采样）
+    QSize   m_sourceSize;    // 原图尺寸（只用于底栏显示）
+    QTimer* m_rescaleTimer = nullptr;   // 缩放节流：停手后才做一次平滑缩放
     bool    m_persistent = true;   // false = 不写存档（自检用）
 
     // ★ 本次打开这一页期间"已经看过的图"（存放磁盘文件名，不是下标）★

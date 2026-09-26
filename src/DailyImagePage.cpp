@@ -1,4 +1,5 @@
 #include "DailyImagePage.h"
+#include "UiFont.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -15,8 +16,62 @@
 #include <QUrl>
 #include <QMouseEvent>
 #include <QResizeEvent>
+#include <QScreen>
+#include <QGuiApplication>
+#include <QTimer>
 
 #include <utility>      // std::as_const（见 findDailyImageDir 那里的说明）
+
+// =============================================================================
+//  缩放相关的两个常数（见 rescaleImage / applyImage 的说明）
+// =============================================================================
+namespace {
+
+// 停手多久之后才做那次"平滑"缩放。120ms 比双击间隔短，用户感觉不到延迟，
+// 又足够把一次连续拖动产生的一长串 resizeEvent 合并掉。
+constexpr int kRescaleSettleMs = 120;
+
+// 源图最多留多清晰。
+//   ★ 判据是"面板最多能长多大"，不是"现在多大" ★
+//     面板可以铺满屏幕，那时候图片区有上千像素宽。如果按当前控件尺寸去降采样，
+//     一按"铺满"就会把这张小图拉大 —— 直接糊掉。所以取所有屏幕里最大的那块的
+//     物理像素长边：再大在这个程序里也没地方显示。
+//   ★ 为什么要有个上限 ★
+//     平滑缩放的开销约等于「目标像素数 × 缩放倍数」。用户的插画可能有好几千像素
+//     （本机实测有 7000px 的），每次窗口一变就从头缩一遍就是"这一页一拉就卡"的根。
+//     有了上限，单次开销至少被压到一个可预期的范围内（配合下面的节流 → 一次拖动只做一次）。
+//   ★ 为什么要留 1200 的下限 ★
+//     屏幕很小（或者 DPI 报得很怪）时也留点余量，免得连正常窗口都喂不饱。
+int sourceCapPx()
+{
+    int cap = 0;
+    const QList<QScreen*> screens = QGuiApplication::screens();
+    for (const QScreen* s : screens)
+    {
+        if (!s)
+            continue;
+        // geometry() 是逻辑像素，乘以 DPR 才是真正要画的物理像素
+        const qreal dpr = s->devicePixelRatio();
+        cap = qMax(cap, int(qMax(s->geometry().width(), s->geometry().height()) * dpr));
+    }
+    return qMax(1200, cap);
+}
+
+// 把原图降采样到"够用"的一版（比上限还小就原样返回）。
+QPixmap downscaleSourceForDisplay(const QPixmap& src)
+{
+    const int longSide = qMax(src.width(), src.height());
+    if (longSide <= 0)
+        return src;
+
+    const int cap = sourceCapPx();
+    if (longSide <= cap)
+        return src;               // 本来就不大，不动它
+
+    return src.scaled(cap, cap, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+}
+
+} // namespace
 
 // =============================================================================
 //  存档
@@ -28,6 +83,32 @@ static QSettings dailySettings()
 {
     return QSettings(QSettings::IniFormat, QSettings::UserScope,
                      QStringLiteral("PetPal"), QStringLiteral("daily_image"));
+}
+
+// =============================================================================
+//  样式表 / 字号档位
+//  包在 UiFont::styleSheet() 里 —— 它按"界面字号"档位改写 font-size（见 UiFont.h）
+// =============================================================================
+void DailyImagePage::applyStyle()
+{
+    setStyleSheet(UiFont::styleSheet(QStringLiteral(R"(
+        QLabel#cap   { color: #888780; font-size: 12px; }
+        QLabel#hint  { color: #888780; font-size: 12px; }
+        QLabel#frame { background: #F1EFE8; border-radius: 8px;
+                       color: #B4B2A9; font-size: 13px; }
+        QPushButton#ghost {
+            background: transparent; color: #534AB7; border: 1px solid #AFA9EC;
+            border-radius: 7px; padding: 4px 12px; font-size: 12px;
+        }
+        QPushButton#ghost:hover   { background: #EEEDFE; }
+        QPushButton#ghost:pressed { background: #E3E0FB; }
+    )")));
+}
+
+void DailyImagePage::applyUiScale()
+{
+    applyStyle();
+    updateProgressLabel();     // 字号一变行宽就变，那句进度文字要重排一次
 }
 
 // =============================================================================
@@ -84,18 +165,14 @@ QString DailyImagePage::findDailyImageDir()
 DailyImagePage::DailyImagePage(bool persistent, QWidget* parent)
     : QWidget(parent), m_persistent(persistent)
 {
-    setStyleSheet(QStringLiteral(R"(
-        QLabel#cap   { color: #888780; font-size: 12px; }
-        QLabel#hint  { color: #888780; font-size: 12px; }
-        QLabel#frame { background: #F1EFE8; border-radius: 8px;
-                       color: #B4B2A9; font-size: 13px; }
-        QPushButton#ghost {
-            background: transparent; color: #534AB7; border: 1px solid #AFA9EC;
-            border-radius: 7px; padding: 4px 12px; font-size: 12px;
-        }
-        QPushButton#ghost:hover   { background: #EEEDFE; }
-        QPushButton#ghost:pressed { background: #E3E0FB; }
-    )"));
+    applyStyle();
+
+    // 缩放的"停手"定时器：拖动窗口时每一次 resizeEvent 只做快速缩放，
+    // 这个定时器被不断重启，等真正停手 120ms 后才补一次平滑缩放（见 resizeEvent）。
+    m_rescaleTimer = new QTimer(this);
+    m_rescaleTimer->setSingleShot(true);
+    m_rescaleTimer->setInterval(kRescaleSettleMs);
+    connect(m_rescaleTimer, &QTimer::timeout, this, [this]() { rescaleImage(/*smooth=*/true); });
 
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(20, 16, 20, 16);
@@ -300,6 +377,7 @@ void DailyImagePage::refreshForToday()
     if (m_dir.isEmpty())
     {
         m_source = QPixmap();
+        m_sourceSize = QSize();
         m_currentPath.clear();
         m_image->setPixmap(QPixmap());
         m_image->setText(QStringLiteral("没找到 daily_image 文件夹"));
@@ -315,6 +393,7 @@ void DailyImagePage::refreshForToday()
     if (path.isEmpty())
     {
         m_source = QPixmap();
+        m_sourceSize = QSize();
         m_currentPath.clear();
         m_image->setPixmap(QPixmap());
         m_image->setText(QStringLiteral("daily_image 里还没有图片"));
@@ -351,6 +430,7 @@ void DailyImagePage::applyImage(const QString& path)
         m_seenThisOpen.insert(QFileInfo(path).fileName());
 
         m_source = QPixmap();
+        m_sourceSize = QSize();
         m_currentPath.clear();
         m_image->setPixmap(QPixmap());
         m_image->setText(QStringLiteral("这张图读不出来"));
@@ -360,13 +440,15 @@ void DailyImagePage::applyImage(const QString& path)
     }
 
     m_currentPath = path;
-    m_source      = pm;
+    m_sourceSize  = pm.size();       // 原图尺寸：底栏那行要显示它（下面 m_source 可能被缩小）
+    m_source      = downscaleSourceForDisplay(pm);
 
     // 真显示出来的也记一笔，理由同上：抽到过就别再抽第二次
     m_seenThisOpen.insert(QFileInfo(path).fileName());
 
     m_image->setText(QString());     // 清掉可能存在的提示文字
-    rescaleImage();
+    m_rescaleTimer->stop();          // 刚换图，之前排队的那个平滑缩放不用再等了
+    rescaleImage(/*smooth=*/true);
 
     m_caption->setText(captionText());
     updateProgressLabel();
@@ -383,8 +465,8 @@ QString DailyImagePage::captionText() const
 
     return QStringLiteral("%1\u3000·\u3000原图 %2 × %3\u3000·\u3000双击用系统看图工具打开")
         .arg(name)
-        .arg(m_source.width())
-        .arg(m_source.height());
+        .arg(m_sourceSize.width())
+        .arg(m_sourceSize.height());
 }
 
 // =============================================================================
@@ -454,8 +536,14 @@ void DailyImagePage::onShuffle()
 
 // =============================================================================
 //  等比缩放填进可用区域
+//
+//  ★ 两条路径 ★（smooth 由调用方选）
+//    · false —— 最近邻。几毫秒，给"正在拖窗口"这条高频路径用：画面立刻跟上，
+//      虽然边缘糙一点，但拖动过程中看不出来；
+//    · true  —— 平滑。停手之后补一次，最终看到的是干净的那张。
+//  源图已经降过采样（见 downscaleSourceForDisplay），所以这两条都很便宜。
 // =============================================================================
-void DailyImagePage::rescaleImage()
+void DailyImagePage::rescaleImage(bool smooth)
 {
     if (m_source.isNull() || !m_image)
         return;
@@ -465,13 +553,26 @@ void DailyImagePage::rescaleImage()
     if (avail.width() < 16 || avail.height() < 16)
         return;                     // 布局还没算好，等下一次 resizeEvent
 
-    m_image->setPixmap(m_source.scaled(avail, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    m_image->setPixmap(m_source.scaled(avail, Qt::KeepAspectRatio,
+                                       smooth ? Qt::SmoothTransformation
+                                              : Qt::FastTransformation));
 }
 
+// =============================================================================
+//  窗口尺寸变了
+//
+//  ★ 为什么不能在这里直接做平滑缩放 ★
+//    拖动窗口边缘时 resizeEvent 会连着来几十上百次。每次都平滑重缩一遍
+//    （原图几千像素时单次就是几百毫秒）→ 面板跟着一起卡，鼠标都已经松了画面还在追。
+//    所以拆成两步：先做一次便宜的快速缩放保证跟手，再用一个"停手"定时器把
+//    这串事件合并成一次平滑缩放。定时器每次都会被重启，所以只有真正停下来才触发。
+// =============================================================================
 void DailyImagePage::resizeEvent(QResizeEvent* event)
 {
     QWidget::resizeEvent(event);
-    rescaleImage();                 // 面板被拉伸 / 切到这一页时重新适配
+
+    rescaleImage(/*smooth=*/false);     // 便宜的那一步：先让画面跟上
+    m_rescaleTimer->start();            // 停手后再来一次平滑的
 }
 
 void DailyImagePage::showEvent(QShowEvent* event)

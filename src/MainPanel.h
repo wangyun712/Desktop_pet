@@ -47,6 +47,10 @@ public:
     void toggleMaximized();
     bool isMaximizedPanel() const { return m_maximized; }
 
+    // 界面字号档位变了之后重新套一遍样式表（外壳自己的那部分）。
+    // 页面各自的字号由各自的 applyUiScale() 负责，这里只管导航和窗控按钮。
+    void applyUiScale();
+
 protected:
     void paintEvent(QPaintEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
@@ -57,6 +61,7 @@ private:
     static constexpr int TOP_BAR_H = 38;    // 顶部条高度：既是标题栏，也是拖动把手
 
     void updateMaxButtonIcon();             // □ / ❐ 跟着最大化状态切
+    void applyStyle();                      // 外壳的样式表（构造时和改字号时都要套）
 
     QWidget*        m_topBar   = nullptr;
     QListWidget*    m_nav      = nullptr;

@@ -25,6 +25,9 @@ class AffectionPage : public QWidget
 public:
     explicit AffectionPage(AffectionSystem* sys, QWidget* parent = nullptr);
 
+    // 界面字号档位变了之后重新套样式表（见 UiFont.h）
+    void applyUiScale();
+
 signals:
     void petPetted();        // 「摸摸」
     void feedRequested();    // 「喂食」

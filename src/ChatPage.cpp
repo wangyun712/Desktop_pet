@@ -2,6 +2,7 @@
 
 #include "AffectionSystem.h"
 #include "PetConfig.h"
+#include "UiFont.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -23,19 +24,16 @@
 static constexpr int AVATAR_PX = 30;
 
 // =============================================================================
-//  构造
+//  样式表 / 字号档位
+//
+//  QSS 抽成方法而不是写在构造函数里：**改界面字号时要再套一遍**，
+//  写两份迟早漏一处、长出两种字号。包在 UiFont::styleSheet() 里，
+//  它会按当前档位改写 font-size（见 UiFont.h）。
+//  气泡是按 objectName 匹配的，所以整页样式一换，已经发出去的那些气泡也跟着变。
 // =============================================================================
-ChatPage::ChatPage(AffectionSystem* sys, QWidget* parent)
-    : QWidget(parent), m_sys(sys)
+void ChatPage::applyStyle()
 {
-    // 头像只裁这一次（每个气泡都用它），也避免做成函数里的 static QPixmap
-    m_avatar = makeAvatar(AVATAR_PX);
-
-    // 曲库扫盘。构造时先扫一次，之后每次切到这一页再扫一遍（见 showEvent）——
-    // 用户往里丢歌词文件，切回来就生效，这就是"动态加歌"的全部机关。
-    m_songs.reload();
-
-    setStyleSheet(QStringLiteral(R"(
+    setStyleSheet(UiFont::styleSheet(QStringLiteral(R"(
         QLabel#cap { color: #888780; font-size: 12px; }
 
         QScrollArea#msgArea { background: #F7F6F2; border: 1px solid #E5E3DB;
@@ -56,7 +54,39 @@ ChatPage::ChatPage(AffectionSystem* sys, QWidget* parent)
                            border-radius: 8px; padding: 7px 14px; font-size: 12px; }
         QPushButton#send:hover    { background: #8FDAFF; }
         QPushButton#send:disabled { background: #D3D1C7; color: #888780; }
-    )"));
+    )")));
+}
+
+void ChatPage::applyUiScale()
+{
+    applyStyle();
+
+    // 气泡的高度是"按宽度换行"算出来的（QLabel 的 heightForWidth）。字号变大
+    // 而宽度上限没变时，Qt 不一定自己重算高度 —— 先把上限清掉再设回去，
+    // 逼它按新字号重新量一次，否则会看到"字变大了但气泡还是原来那么高"。
+    for (QLabel* b : std::as_const(m_bubbles))
+    {
+        if (b)
+            b->setMaximumWidth(QWIDGETSIZE_MAX);
+    }
+    applyBubbleWidths();
+    scrollToBottom();
+}
+
+// =============================================================================
+//  构造
+// =============================================================================
+ChatPage::ChatPage(AffectionSystem* sys, QWidget* parent)
+    : QWidget(parent), m_sys(sys)
+{
+    // 头像只裁这一次（每个气泡都用它），也避免做成函数里的 static QPixmap
+    m_avatar = makeAvatar(AVATAR_PX);
+
+    // 曲库扫盘。构造时先扫一次，之后每次切到这一页再扫一遍（见 showEvent）——
+    // 用户往里丢歌词文件，切回来就生效，这就是"动态加歌"的全部机关。
+    m_songs.reload();
+
+    applyStyle();
 
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(20, 16, 20, 16);
@@ -469,7 +499,7 @@ QString ChatPage::describeChat()
 
     // 光有数字看不出逻辑对不对，所以拿真实输入跑一条完整的样例出来。
     // 跑的是运行时同一份 matchIntent + Picker —— 不是另写一段样例代码。
-    const QString        sample = QStringLiteral("你今天唱首歌给我听好不好");
+    const QString         sample = QStringLiteral("你今天唱首歌给我听好不好");
     const ChatScript::Hit hit    = ChatScript::matchIntent(sample);
 
     ChatScript::Picker picker;
@@ -481,7 +511,33 @@ QString ChatPage::describeChat()
                .arg(hit.id.isEmpty() ? QStringLiteral("(兜底)") : hit.id, hit.label)
                .arg(hit.score);
     out += QStringLiteral("               → 台词「%1」\r\n").arg(reply);
-    out += QStringLiteral("  挑词规则  : 同一话题连说 → \"你刚说过呀\"；"
-                          "抽到回显片段 → 回声式；关系到亲近 → 熟络版\r\n");
+
+    // 回归样例一：点名问言和 —— 必须命中 partnerYanhe，只答言和的事，
+    // 不许退回伙伴公共池随机抓一句张冠李戴。
+    const QString         sampleP = QStringLiteral("言和最近怎么样");
+    const ChatScript::Hit hitP    = ChatScript::matchIntent(sampleP);
+    ChatScript::Picker    pickerP;
+    const QString         replyP = pickerP.pick(hitP);
+
+    out += QStringLiteral("  样例      : 「%1」\r\n").arg(sampleP);
+    out += QStringLiteral("               → 意图 %1（%2）\r\n").arg(hitP.id, hitP.label);
+    out += QStringLiteral("               → 台词「%1」\r\n").arg(replyP);
+
+    // 回归样例二：追问接续 —— 上一句在聊阿绫，这句只有"然后呢"，
+    // matchIntent 必然落空，要由 Picker 接着阿绫说，不许掉进兜底。
+    const QString         sampleF = QStringLiteral("然后呢");
+    const ChatScript::Hit hitF    = ChatScript::matchIntent(sampleF);
+    ChatScript::Picker    pickerF;
+    pickerF.lastIntentId = QStringLiteral("partnerAya");
+    const QString         replyF = pickerF.pick(hitF);
+
+    out += QStringLiteral("  样例      : 「%1」（上一句在聊阿绫）\r\n").arg(sampleF);
+    out += QStringLiteral("               → 意图 %1，接续 partnerAya\r\n")
+               .arg(hitF.intentIndex < 0 ? QStringLiteral("(兜底→接续)") : hitF.id);
+    out += QStringLiteral("               → 台词「%1」\r\n").arg(replyF);
+
+    out += QStringLiteral("  挑词规则  : 问哪个伙伴就只答哪个；同一话题连说 → \"你刚说过呀\"；\r\n"
+                          "              「然后呢」→ 接着上一句说；抽到回显片段 → 回声式；\r\n"
+                          "              关系到亲近 → 熟络版\r\n");
     return out;
 }

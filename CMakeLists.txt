@@ -52,6 +52,8 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
 set(PROJECT_SOURCES
     src/main.cpp
     src/PetConfig.h
+    src/UiFont.h
+    src/UiFont.cpp
     src/AnimationController.h
     src/AnimationController.cpp
     src/PetBehaviorController.h
@@ -72,6 +74,18 @@ set(PROJECT_SOURCES
     src/SongLibrary.h
     src/ChatPage.h
     src/ChatPage.cpp
+    src/TrackMeta.h
+    src/MusicLibrary.h
+    src/MusicLibrary.cpp
+    src/TrackListModel.h
+    src/TrackListModel.cpp
+    src/AudioPlayer.h
+    src/AudioPlayer.cpp
+    src/PlayerPage.h
+    src/PlayerPage.cpp
+    # ★ miniaudio 4MB 的实现只在这一个文件里展开 ★
+    #   拆出来是为了"改播放器逻辑不用重编 4MB"。详见该文件开头的说明。
+    third_party/miniaudio_impl.cpp
 )
 
 set(PROJECT_RESOURCES
@@ -88,8 +102,10 @@ add_executable(PetPal WIN32
 )
 
 # src 作为头文件搜索根目录，这样代码里就能写 #include "DesktopPet.h"
+# third_party 是为了让 AudioPlayer.cpp 里能直接写 #include "miniaudio.h"
 target_include_directories(PetPal PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
 target_link_libraries(PetPal PRIVATE
@@ -131,6 +147,7 @@ target_link_libraries(PetPal PRIVATE
 # ---------------------------------------------------------------------------
 set(PETPAL_HEADERS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/PetConfig.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/UiFont.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/AnimationController.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/PetBehaviorController.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/DesktopPet.h"
@@ -142,10 +159,16 @@ set(PETPAL_HEADERS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ChatScript.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/SongLibrary.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ChatPage.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/TrackMeta.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/MusicLibrary.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/TrackListModel.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/AudioPlayer.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/PlayerPage.h"
 )
 
 set_property(SOURCE
     src/main.cpp
+    src/UiFont.cpp
     src/AnimationController.cpp
     src/PetBehaviorController.cpp
     src/DesktopPet.cpp
@@ -155,6 +178,10 @@ set_property(SOURCE
     src/SettingsPage.cpp
     src/DailyImagePage.cpp
     src/ChatPage.cpp
+    src/MusicLibrary.cpp
+    src/TrackListModel.cpp
+    src/AudioPlayer.cpp
+    src/PlayerPage.cpp
     APPEND PROPERTY OBJECT_DEPENDS ${PETPAL_HEADERS}
 )
 
@@ -173,4 +200,12 @@ set_property(SOURCE
 # ---------------------------------------------------------------------------
 if (MSVC)
     target_compile_options(PetPal PRIVATE /utf-8 /wd4828)
+
+    # ★ miniaudio 那个实现单元单独放行 ★
+    #   它是第三方代码（4MB、上百个后端分支），按本项目的警告等级去编译能刷出
+    #   成百上千条警告，把真正有用的那几条淹掉。
+    #   /bigobj 是因为它的对象文件节数超过 MSVC 默认上限。
+    #   注意是 SOURCE 级而不是 TARGET 级：不然整个项目都被一起静音了。
+    set_source_files_properties(third_party/miniaudio_impl.cpp PROPERTIES
+        COMPILE_OPTIONS "/w;/bigobj")
 endif()

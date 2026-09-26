@@ -7,6 +7,8 @@
 #include "SettingsPage.h"
 #include "DailyImagePage.h"
 #include "ChatPage.h"
+#include "PlayerPage.h"
+
 
 #include <QApplication>
 #include <QGuiApplication>
@@ -25,6 +27,19 @@
 #include <QRandomGenerator>
 #include <QtMath>
 #include <QDebug>
+
+// Win32：只为把"始终置顶"重新钉回去（见下面 ensureOnTop）。
+// 必须放在所有 Qt 头之后 —— windows.h 会定义 min/max 两个宏，
+// 先引它会把后面 Qt 头里的 std::min/std::max 全部搞乱。
+#ifdef Q_OS_WIN
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
 
 // =============================================================================
 //  构造：只做"搭建"，不做"启动"
@@ -118,6 +133,82 @@ void DesktopPet::setupWindow()
 
     // 先给一个占位尺寸，真正的尺寸在第一次拿到帧图后由 resizeWindowForState 算出来
     resize(1, 1);
+}
+
+// =============================================================================
+//  把"始终置顶"重新钉回系统窗口上（Windows 专有补丁）
+//
+//  症状：打开面板 -> 关掉面板 -> 桌宠就不再是最上层了，会被别的窗口盖住。
+//
+//  根因：setupWindow() 里的 Qt::WindowStaysOnTopHint 只是让窗口在创建时带上
+//  WS_EX_TOPMOST 这一位。但 Windows 会在下面这些时机**背着 Qt**把这一位摘掉：
+//    · 窗口 hide() 之后再 show()（藏进状态栏再恢复）
+//    · 同进程/别的进程的另一个顶层窗口开开关关，本窗口被"停用"又没人把它叫回来
+//  摘掉之后 Qt 那边毫无察觉 —— windowFlags() 依然报告自己是置顶，所以从
+//  Qt 接口这一侧怎么查都查不出问题，唯一办法是拿系统 API 重新钉一遍。
+//
+//  为什么用 SetWindowPos 而不是再 setWindowFlags 一次：
+//  setWindowFlags 会让 Qt 销毁并重建原生窗口（画面闪一下、位置和透明属性都可能丢），
+//  SetWindowPos 是就地改 z-order 位，窗口不动、不重绘、不抢焦点。
+//  三个标志各管一件事：SWP_NOMOVE/NOSIZE 别动位置尺寸，SWP_NOACTIVATE 别抢前台。
+//  这个调用是幂等的 —— 已经是 topmost 时再调一次没有副作用。
+// =============================================================================
+void DesktopPet::ensureOnTop()
+{
+#ifdef Q_OS_WIN
+    // 真正干活的那一下。抽成 lambda 是因为下面要调它两次（当下一次、下一轮再一次）。
+    const auto pin = [this]() {
+        if (!isVisible())
+            return;                 // 没显示的时候钉了没意义，下一次 show 还会再来一遍
+
+        const HWND hwnd = reinterpret_cast<HWND>(winId());
+        if (!hwnd)
+            return;
+
+        // 钉之前先看一眼原来在不在 —— 不在就说明这次真的踩到了那个坑。
+        // 这行日志是给排查用的：在 Qt Creator 的 Application Output 里看到它，
+        // 就等于当场抓住了"置顶被系统摘掉"的现行，而不是只能靠肉眼觉得"好像被盖住了"。
+        if ((::GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0)
+            qWarning() << "[PetPal] 桌宠的置顶位掉了，已重新钉上。";
+
+        ::SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    };
+
+    pin();
+
+    // 再排一次到下一轮事件循环。
+    // 为什么一遍不够：让我们重钉的那些动作（弹出菜单正关掉、面板刚被激活）在本次调用
+    // 之后还会往窗口管理器里继续塞消息，系统按"谁后到谁说了算"处理 z-order。
+    // 抢在它们前面钉可能被随后的调整盖掉，所以延后一轮落到它们后面再补一下。
+    // 这一下是幂等的，而且窗口已经不可见时会自己跳过。
+    QTimer::singleShot(0, this, pin);
+#endif
+}
+
+bool DesktopPet::reallyOnTop() const
+{
+#ifdef Q_OS_WIN
+    const HWND hwnd = reinterpret_cast<HWND>(winId());
+    if (!hwnd)
+        return false;
+    return (::GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+#else
+    return true;
+#endif
+}
+
+// =============================================================================
+//  窗口重新可见：顺手把置顶钉回去
+//
+//  选 showEvent 而不是在 start()/restoreFromTray() 里各写一遍，
+//  是因为"重新变得可见"的入口以后可能还会多（比如加个开机自启、加个多屏切换），
+//  写在这里就不怕漏。面板开关那两处桌宠并没有 hide/show，所以那边单独补（见 openPanel/closePanel）。
+// =============================================================================
+void DesktopPet::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    ensureOnTop();
 }
 
 // =============================================================================
@@ -334,6 +425,26 @@ void DesktopPet::onTick()
 }
 
 // =============================================================================
+//  把窗口挪到 m_pos 的位置
+//
+//  ★ 这里挡了一道"位置没变就别动" ★
+//    桌宠窗口是 无边框 + 全透明（WA_TranslucentBackground），Windows 上走的是
+//    分层窗口那条路径 —— 每调一次 move()，系统都要把整块带 alpha 的内容重新合成。
+//    而很多时候位置其实没变：
+//      · 飞行时上下浮动只有几个像素，取整后经常和上一帧落在同一行；
+//      · 收步末尾那几帧速度已经衰减到接近 0；
+//      · 屏幕边界钳位之后原地不动也是常态。
+//    这些情况下再 move() 一次纯属白干（重定位 + 重绘 + 重合成）。
+//    判据用"取整后的结果"，因为真正决定窗口位置的就是这个整数坐标。
+// =============================================================================
+void DesktopPet::applyWindowPos()
+{
+    const QPoint topLeft(qRound(m_pos.x()), qRound(m_pos.y()));
+    if (topLeft != pos())
+        move(topLeft);
+}
+
+// =============================================================================
 //  移动：走路和飞行
 //
 //  ★ 这是"桌宠真的在走"而不是"原地播放动画"的关键 ★
@@ -365,7 +476,7 @@ void DesktopPet::tickMovement(double dt)
             m_pos.setX(m_pos.x() + m_moveDir * PetCfg::WALK_SPEED_PPS * k * dt);
 
             clampPosition(/*allowTurn=*/false);   // 收步时撞到边也不转身，直接站住
-            move(qRound(m_pos.x()), qRound(m_pos.y()));
+            applyWindowPos();
         }
         return;
     }
@@ -381,7 +492,7 @@ void DesktopPet::tickMovement(double dt)
         m_velY = s.velY;
         m_pos.setY(s.y);
 
-        move(qRound(m_pos.x()), qRound(m_pos.y()));   // 水平方向一动不动，纯垂直下落
+        applyWindowPos();                             // 水平方向一动不动，纯垂直下落
 
         if (s.landed)
             landFromFall();
@@ -432,7 +543,7 @@ void DesktopPet::tickMovement(double dt)
     // 位置是 double，只有真正调用 move() 时才取整。
     // 如果直接用 int 累加，60px/s 在 60Hz 下每帧只有 1 像素，误差会被吃掉导致"走不动"。
     clampPosition();
-    move(qRound(m_pos.x()), qRound(m_pos.y()));
+    applyWindowPos();
 }
 
 // =============================================================================
@@ -476,7 +587,7 @@ void DesktopPet::clampPosition(bool allowTurn)
 void DesktopPet::clampToScreen(bool allowTurn)
 {
     clampPosition(allowTurn);
-    move(qRound(m_pos.x()), qRound(m_pos.y()));
+    applyWindowPos();
 }
 
 void DesktopPet::syncPosFromWindow()
@@ -638,7 +749,7 @@ void DesktopPet::stopMoving(bool snapToGround)
     {
         // 落地：把高度还原
         m_pos.setY(m_flyBaseY);
-        move(qRound(m_pos.x()), qRound(m_pos.y()));
+        applyWindowPos();
     }
 
     // 下落途中被别的事情打断（点击、右键菜单里的动作）：绝不能让它悬在半空，
@@ -1332,9 +1443,15 @@ QString DesktopPet::debugTrayRoundTrip()
 
     const auto yn = [](bool b) { return b ? QStringLiteral("是") : QStringLiteral("否"); };
 
+    // ★ 为什么要专门测这一位 ★
+    //   "桌宠是否真的在最上层"在截图上完全看不出来，而 Qt 的 windowFlags() 又只反映意图、
+    //   反映不了系统真实状态。用户报的"开一次面板再关掉，桌宠就被别的窗口盖住了"
+    //   正好是"隐藏/显示之后 WS_EX_TOPMOST 被系统摘掉"这一类问题，
+    //   所以往返前后各读一次系统上的真实值，让这条路径上的回归当场现形。
     QString s;
-    s += QStringLiteral("  隐藏前 : 窗口可见=%1  心跳=%2  自动行为=%3\r\n")
-             .arg(yn(isVisible()), yn(m_tick->isActive()), yn(m_behavior->autoEnabled()));
+    s += QStringLiteral("  隐藏前 : 窗口可见=%1  心跳=%2  自动行为=%3  实际置顶位=%4\r\n")
+             .arg(yn(isVisible()), yn(m_tick->isActive()), yn(m_behavior->autoEnabled()),
+                  yn(reallyOnTop()));
 
     hideToTray();
     s += QStringLiteral("  隐藏后 : 窗口可见=%1  心跳=%2  自动行为=%3  状态栏图标=%4\r\n")
@@ -1342,14 +1459,19 @@ QString DesktopPet::debugTrayRoundTrip()
                   yn(m_tray->isVisible()));
 
     restoreFromTray();
-    s += QStringLiteral("  恢复后 : 窗口可见=%1  心跳=%2  自动行为=%3  状态栏图标=%4\r\n")
+    const bool topAfter = reallyOnTop();
+    s += QStringLiteral("  恢复后 : 窗口可见=%1  心跳=%2  自动行为=%3  状态栏图标=%4  实际置顶位=%5\r\n")
              .arg(yn(isVisible()), yn(m_tick->isActive()), yn(m_behavior->autoEnabled()),
-                  yn(m_tray->isVisible()));
+                  yn(m_tray->isVisible()), yn(topAfter));
 
-    // 往返一趟之后应该完全回到原样：窗口在、心跳在跑、隐藏标记清掉
+    // 往返一趟之后应该完全回到原样：窗口在、心跳在跑、隐藏标记清掉、置顶位还在
     const bool ok = isVisible() && m_tick->isActive() && !m_hiddenToTray && !m_tray->isVisible();
     s += ok ? QStringLiteral("  [OK] 隐藏/恢复往返正常，状态都收回来了\r\n")
             : QStringLiteral("  [!!] 往返之后状态不对，检查 hideToTray / restoreFromTray\r\n");
+
+    // 单独一条：即使上面的状态都对，置顶位掉了照样会被别的窗口盖住。
+    s += topAfter ? QStringLiteral("  [OK] 恢复后仍在最上层（WS_EX_TOPMOST 在位）\r\n")
+                  : QStringLiteral("  [!!] 恢复后置顶失效了 —— 检查 restoreFromTray / ensureOnTop\r\n");
     return s;
 }
 
@@ -1424,6 +1546,14 @@ void DesktopPet::openPanel()
             runChain(QVector<PetState>{ s });
         });
 
+        // ---- 播放器页 ----
+        // ★ 这一页刻意"什么都不接" ★（用户明确的要求：听歌不带动桌宠）
+        //  没有好感度、没有桌宠状态、没有菜单联动 —— 它就是一块独立的播放器，
+        //  自己选文件夹、自己扫、自己放。这也是它和别的几页最不一样的地方：
+        //  别的页都跟桌宠有来有往，只有它安安静静待在那儿。
+        m_playerPage = new PlayerPage(m_panel);
+        m_panel->addPage(QStringLiteral("播放器"), m_playerPage);
+
         // ---- 设置页 ----
         // 弹窗确认已经在页面里做完了（那是界面自己的事），这里收到的信号
         // 只代表"用户确实点过确认"。真正清零这一下仍然放在这里 ——
@@ -1436,17 +1566,42 @@ void DesktopPet::openPanel()
             // 所以两个页面的数字会自动刷新，不用在这里手动通知。
             m_affection->resetAll();
         });
+
+        // ---- 界面字号改了 -> 所有页面重套一遍样式 ----
+        // ★ 为什么六处都要刷，而不是"只刷当前这一页" ★
+        //   页面只在构造时套一次样式表（不是每次切页都套），所以漏刷的那一页
+        //   要等重启才会变成新字号 —— 这种"有的页变了有的页没变"的 bug
+        //   很容易被当成偶发，排查起来很亏。统一刷一遍，代价只是拼六段字符串。
+        //   还要刷 m_panel 自己：左侧导航和右上那几个窗控按钮是外壳的，不归页面管。
+        connect(m_setPage, &SettingsPage::uiScaleChanged, this, [this]() {
+            if (m_panel)      m_panel->applyUiScale();
+            if (m_affPage)    m_affPage->applyUiScale();
+            if (m_dailyPage)  m_dailyPage->applyUiScale();
+            if (m_chatPage)   m_chatPage->applyUiScale();
+            if (m_playerPage) m_playerPage->applyUiScale();
+            if (m_setPage)    m_setPage->applyUiScale();
+        });
     }
 
     // 居中在"桌宠所在的那块屏幕"，不是主屏。
     // 双屏时这一点很关键：桌宠在副屏上待着，面板却弹到主屏正中，会像是别的程序弹出来的。
     m_panel->showCenteredIn(availableScreenRect());
+
+    // ★ 面板激活之后必须重钉一次 ★
+    //   showCenteredIn() 内部会 raise()+activateWindow() 把面板叫到前面；
+    //   这一"激活另一个顶层窗口"的动作正好是 Windows 悄悄摘掉桌宠 WS_EX_TOPMOST 的
+    //   典型时机（用户报的"开一次面板再关掉，桌宠就不再最上层了"就是这么来的）。
+    //   SWP_NOACTIVATE 保证重钉不会把前台焦点从面板抢回桌宠身上。
+    ensureOnTop();
 }
 
 void DesktopPet::closePanel()
 {
     if (m_panel && m_panel->isVisible())
         m_panel->hide();
+
+    // 面板一走，前台窗口就交还给别人了 —— 和打开时同一个道理，这里再钉一次最保险。
+    ensureOnTop();
 }
 
 void DesktopPet::noteChat()
