@@ -256,7 +256,28 @@ const Track* MusicLibrary::trackAt(int index) const
     return &m_tracks.at(index);
 }
 
-void MusicLibrary::appendBatch(const QVector<Track>& batch)
+int MusicLibrary::indexOfPath(const QString& path) const
+{
+    // 线性找（收藏加载时一次一批，量级有限）；路径按字面比对
+    for (int i = 0; i < m_tracks.size(); ++i)
+        if (m_tracks.at(i).path == path)
+            return i;
+    return -1;
+}
+
+void MusicLibrary::removeAt(int index)
+{
+    if (index < 0 || index >= m_tracks.size())
+        return;
+    m_tracks.remove(index);
+    m_normKeys.remove(index);
+
+    // 索引变了，上次的收窄缓存作废
+    m_lastQuery.clear();
+    m_lastResult.clear();
+}
+
+void MusicLibrary::appendBatch(const QVector<Track>& batch, bool announce)
 {
     m_tracks.reserve(m_tracks.size() + batch.size());
     m_normKeys.reserve(m_normKeys.size() + batch.size());
@@ -271,7 +292,22 @@ void MusicLibrary::appendBatch(const QVector<Track>& batch)
     m_lastQuery.clear();
     m_lastResult.clear();
 
-    emit scanBatch(batch);
+    // announce = false：只入库、不广播 —— 流式播放的库行不想让
+    // onScanBatch 把列表刷一遍（那样同一首歌会出现"在线行 + 联网行"两行）
+    if (announce)
+        emit scanBatch(batch);
+}
+
+void MusicLibrary::updateTrackPath(int index, const QString& newPath)
+{
+    if (index < 0 || index >= m_tracks.size())
+        return;
+    m_tracks[index].path = newPath;
+    m_normKeys[index] = buildKey(m_tracks[index]);
+
+    // 路径变了，上次的收窄缓存作废
+    m_lastQuery.clear();
+    m_lastResult.clear();
 }
 
 void MusicLibrary::finishScan(int total, int skipped)

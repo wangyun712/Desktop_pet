@@ -1,5 +1,6 @@
 #include "MainPanel.h"
 #include "UiFont.h"
+#include "UiTheme.h"
 
 #include <QHBoxLayout>
 #include <QVBoxLayout>
@@ -12,6 +13,7 @@
 #include <QMouseEvent>
 #include <QKeyEvent>
 #include <QShortcut>
+#include <QFile>
 #include <QScreen>
 #include <QGuiApplication>
 #include <QWindow>          // startSystemMove()（见 mousePressEvent 的说明）
@@ -195,12 +197,20 @@ void MainPanel::applyStyle()
             background: #FFFFFF; color: #26215C;
             border-left: 3px solid #7F77DD;
         }
-        QStackedWidget#stack { background: #FFFFFF; border-bottom-right-radius: 12px; }
+        QStackedWidget#stack { background: transparent; border-bottom-right-radius: 12px; }
     )")));
 }
 
 // =============================================================================
 //  自绘圆角卡片
+//
+//  三层，从下往上：
+//    ① 主题底色（UiTheme::PanelBg）—— 没设背景图时看到的就是它；
+//    ② 背景图（设置页导入的那张）：按"盖满"缩放铺住圆角框，多出部分裁掉，
+//       以用户调的不透明度叠在底色上 —— 0% 等于没有图，100% 是原图本色；
+//    ③ 一圈描边（主题 Disabled 色，就是改造前那圈浅灰）。
+//  卡片/导航这些角色带一点透明（见 UiTheme.cpp 顶上的说明），图会从它们
+//  底下隐约透出来；页面 QSS 不用关心这件事。
 // =============================================================================
 void MainPanel::paintEvent(QPaintEvent* event)
 {
@@ -217,8 +227,42 @@ void MainPanel::paintEvent(QPaintEvent* event)
     const qreal  radius = m_maximized ? 0.0 : 12.0;
     path.addRoundedRect(frame, radius, radius);
 
-    p.fillPath(path, QColor(0xFF, 0xFF, 0xFF));            // 白底
-    p.setPen(QPen(QColor(0xD3, 0xD1, 0xC7), 1.0));         // 一圈浅灰描边
+    // ---- ① 主题底色 ----
+    p.fillPath(path, UiTheme::color(UiTheme::PanelBg));
+
+    // ---- ② 背景图 ----
+    // 路径变了才重新读盘（切图/清图的时候），平时重画只动用缓存 ——
+    // 不透明度滑条拖动时每 tick 都会走到这里，不能每次都去磁盘。
+    const QString bgPath = UiTheme::bgImagePath();
+    if (m_bgPath != bgPath)
+    {
+        m_bgPath = bgPath;
+        m_bgImg  = (bgPath.isEmpty() || !QFile::exists(bgPath)) ? QPixmap() : QPixmap(bgPath);
+    }
+
+    if (!m_bgImg.isNull() && UiTheme::bgOpacityF() > 0.0)
+    {
+        const QRectF box     = path.boundingRect();
+        const QSizeF imgSize(m_bgImg.size());
+        // 盖满（cover）：取两个方向里更放大的那个比例。图一定铺满框，
+        // 既不留白边也不拉变形，多出来的部分被圆角框裁掉。
+        const qreal  scale   = qMax(box.width() / imgSize.width(),
+                                    box.height() / imgSize.height());
+        const QRectF target(box.left()   + (box.width()  - imgSize.width()  * scale) / 2.0,
+                            box.top()    + (box.height() - imgSize.height() * scale) / 2.0,
+                            imgSize.width()  * scale,
+                            imgSize.height() * scale);
+
+        p.save();
+        p.setClipPath(path);
+        p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+        p.setOpacity(UiTheme::bgOpacityF());
+        p.drawPixmap(target, m_bgImg, QRectF(m_bgImg.rect()));
+        p.restore();
+    }
+
+    // ---- ③ 描边 ----
+    p.setPen(QPen(UiTheme::color(UiTheme::Disabled), 1.0));   // 一圈浅灰描边
     p.drawPath(path);
 }
 

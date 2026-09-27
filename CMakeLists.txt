@@ -41,7 +41,7 @@ set(CMAKE_AUTORCC ON)
 #  Core / Gui / Widgets 三个模块就够：Widgets 提供 QWidget 那套传统桌面控件，
 #  本项目不使用 QML。
 # ---------------------------------------------------------------------------
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network)
 
 # ---------------------------------------------------------------------------
 #  源文件
@@ -54,6 +54,8 @@ set(PROJECT_SOURCES
     src/PetConfig.h
     src/UiFont.h
     src/UiFont.cpp
+    src/UiTheme.h
+    src/UiTheme.cpp
     src/AnimationController.h
     src/AnimationController.cpp
     src/PetBehaviorController.h
@@ -83,6 +85,17 @@ set(PROJECT_SOURCES
     src/AudioPlayer.cpp
     src/PlayerPage.h
     src/PlayerPage.cpp
+    src/PetSay.h
+    src/PetBubble.h
+    src/PetBubble.cpp
+    src/PetFx.h
+    src/PetFx.cpp
+    src/DesktopLyrics.h
+    src/DesktopLyrics.cpp
+    src/OnlineMusic.h
+    src/OnlineMusic.cpp
+    src/MfDecode.h
+    src/MfDecode.cpp
     # ★ miniaudio 4MB 的实现只在这一个文件里展开 ★
     #   拆出来是为了"改播放器逻辑不用重编 4MB"。详见该文件开头的说明。
     third_party/miniaudio_impl.cpp
@@ -112,7 +125,14 @@ target_link_libraries(PetPal PRIVATE
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
+    Qt6::Network
 )
+
+# Windows 自带的 Media Foundation：B 站音频（AAC/M4S）解码成 WAV 用。
+# miniaudio 只认 MP3/FLAC/WAV，AAC 这条只能靠系统组件转一手。
+if(WIN32)
+    target_link_libraries(PetPal PRIVATE mfplat mfreadwrite mfuuid ole32)
+endif()
 
 # ---------------------------------------------------------------------------
 #  ★ 头文件依赖（第二道保险）—— 这段别删 ★
@@ -148,6 +168,7 @@ target_link_libraries(PetPal PRIVATE
 set(PETPAL_HEADERS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/PetConfig.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/UiFont.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/UiTheme.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/AnimationController.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/PetBehaviorController.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/DesktopPet.h"
@@ -164,11 +185,18 @@ set(PETPAL_HEADERS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/TrackListModel.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/AudioPlayer.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/PlayerPage.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/PetSay.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/PetBubble.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/PetFx.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/DesktopLyrics.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/OnlineMusic.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/MfDecode.h"
 )
 
 set_property(SOURCE
     src/main.cpp
     src/UiFont.cpp
+    src/UiTheme.cpp
     src/AnimationController.cpp
     src/PetBehaviorController.cpp
     src/DesktopPet.cpp
@@ -182,6 +210,11 @@ set_property(SOURCE
     src/TrackListModel.cpp
     src/AudioPlayer.cpp
     src/PlayerPage.cpp
+    src/PetBubble.cpp
+    src/PetFx.cpp
+    src/DesktopLyrics.cpp
+    src/OnlineMusic.cpp
+    src/MfDecode.cpp
     APPEND PROPERTY OBJECT_DEPENDS ${PETPAL_HEADERS}
 )
 

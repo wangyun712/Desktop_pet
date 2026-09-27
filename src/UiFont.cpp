@@ -1,4 +1,5 @@
 #include "UiFont.h"
+#include "UiTheme.h"
 
 #include <QApplication>
 #include <QFont>
@@ -112,28 +113,35 @@ int UiFont::px(int basePx)
 
 QString UiFont::styleSheet(const QString& qss)
 {
+    // ★ 这里是所有页面 QSS 的总闸：先换主题色，再换算字号 ★
+    //   主题换色委托给 UiTheme::styleSheet()（默认主题字面量 → 当前主题色，
+    //   见 UiTheme.h 顶上的说明）—— 放在这里而不是让 6 个页面各自先过一遍
+    //   UiTheme 再过一遍 UiFont：一处接线，以后新页面自动带主题，漏不掉。
+    //   两个改写互不干扰：色值里没有 font-size，font-size 里没有色值。
+    const QString themed = UiTheme::styleSheet(qss);
+
     const int pct = scalePercent();
     if (pct == BASE_PERCENT)
-        return qss;                          // 基准档时原样返回，省一次正则
+        return themed;                       // 基准档：字号原样，只保留主题换色的结果
 
     // 注意大小写和空格：项目里都写 `font-size: 12px;`，但留一点余量
     static const QRegularExpression re(QStringLiteral("font-size\\s*:\\s*(\\d+)\\s*px"));
 
     QString out;
-    out.reserve(qss.size() + qss.size() / 8);
+    out.reserve(themed.size() + themed.size() / 8);
 
     qsizetype last = 0;
-    auto it = re.globalMatch(qss);
+    auto it = re.globalMatch(themed);
     while (it.hasNext())
     {
         const QRegularExpressionMatch m = it.next();
 
-        out += qss.mid(last, m.capturedStart() - last);
+        out += themed.mid(last, m.capturedStart() - last);
         out += QStringLiteral("font-size:%1px")
                    .arg(qMax(1, qRound(double(m.captured(1).toInt()) * double(pct) / 100.0)));
         last = m.capturedEnd();
     }
-    out += qss.mid(last);
+    out += themed.mid(last);
 
     return out;
 }

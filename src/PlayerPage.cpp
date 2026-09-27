@@ -1,10 +1,16 @@
 #include "PlayerPage.h"
 
 #include "AudioPlayer.h"
+#include "DesktopLyrics.h"
+#include "MfDecode.h"
+#include "OnlineMusic.h"
 #include "TrackListModel.h"
 #include "UiFont.h"
+#include "UiTheme.h"
 
 #include <QBuffer>
+#include <algorithm>
+#include <QButtonGroup>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
@@ -17,10 +23,13 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListView>
+#include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPolygonF>
+#include <QPropertyAnimation>
+#include <QEasingCurve>
 #include <QPushButton>
 #include <QRandomGenerator>
 #include <QRegularExpression>
@@ -35,6 +44,17 @@
 #include <QVBoxLayout>
 
 #include <utility>
+
+// -----------------------------------------------------------------------------
+//  歌词高亮用的强调色（主题的深强调角色，和样式表里那套 accent 是一组，
+//  深一档好压住灰底）。★ 是函数不是常量 ★ —— 主题切换后颜色要跟着变，
+//  常量只在进程启动时求一次值，换主题就成"样式表变了、歌词还是旧色"。
+//  ★ 放在文件顶上 ★ 列表委托和歌词样式拼接两处都要用，得先于它们声明。
+// -----------------------------------------------------------------------------
+QColor accentDeepColor()
+{
+    return UiTheme::color(UiTheme::AccentDeep);
+}
 
 // -----------------------------------------------------------------------------
 //  SeekSlider —— "点哪跳哪"的进度条
@@ -185,12 +205,12 @@ private:
     QColor iconColor() const
     {
         if (!isEnabled())
-            return QColor(0xC9, 0xC7, 0xBF);
+            return UiTheme::color(UiTheme::TextDisabled);
         if (isDown())
-            return isMainKey() ? QColor(0xFF, 0xFF, 0xFF) : QColor(0x26, 0x21, 0x5C);
+            return isMainKey() ? QColor(0xFF, 0xFF, 0xFF) : UiTheme::color(UiTheme::AccentText);
         if (underMouse())
-            return isMainKey() ? QColor(0xFF, 0xFF, 0xFF) : QColor(0x26, 0x21, 0x5C);
-        return isMainKey() ? QColor(0xFF, 0xFF, 0xFF) : QColor(0x5F, 0x5E, 0x5A);
+            return isMainKey() ? QColor(0xFF, 0xFF, 0xFF) : UiTheme::color(UiTheme::AccentText);
+        return isMainKey() ? QColor(0xFF, 0xFF, 0xFF) : UiTheme::color(UiTheme::TextMid);
     }
 
     // 图标占控件正中约 44%（默认档）见方 —— 播放键那圈底色比较满，图形小一点才透气
@@ -422,10 +442,11 @@ public:
         const QRect r = opt.rect.adjusted(2, 1, -2, -2);
 
         if (selected)
-            p->fillRect(r, QColor(0xF1, 0xEF, 0xE8));
+            p->fillRect(r, UiTheme::color(UiTheme::NavBg));
 
         if (playing)
-            p->fillRect(QRect(r.left() + 3, r.top() + 9, 3, r.height() - 18), QColor(0x7F, 0x77, 0xDD));
+            p->fillRect(QRect(r.left() + 3, r.top() + 9, 3, r.height() - 18),
+                        UiTheme::color(UiTheme::Accent));
 
         const int textLeft = r.left() + (playing ? 14 : 8);
 
@@ -443,20 +464,34 @@ public:
         const QFontMetrics smallFm(smallFont);
         const int durWidth = smallFm.horizontalAdvance(dur) + 8;
 
+        // ---- 来源徽标（本地 / 联网·网易 / 下载中 42% …）：画在时长左边 ----
+        const QString tag = idx.data(TrackListModel::TagRole).toString();
+        int tagWidth = 0;
+        if (!tag.isEmpty())
+        {
+            const QFont tagFont = smallerFont(opt.font);
+            const QFontMetrics tagFm(tagFont);
+            tagWidth = tagFm.horizontalAdvance(tag) + 10;
+            p->setFont(tagFont);
+            p->setPen(UiTheme::color(UiTheme::TextSub));
+            p->drawText(QRect(r.right() - durWidth - tagWidth, r.top(), tagWidth, r.height()),
+                        Qt::AlignRight | Qt::AlignVCenter, tag);
+        }
+
         p->setFont(smallFont);
-        p->setPen(QColor(0x9A, 0x98, 0x90));
+        p->setPen(UiTheme::color(UiTheme::TextFaint));
         p->drawText(QRect(r.right() - durWidth, r.top(), durWidth, r.height()),
                     Qt::AlignRight | Qt::AlignVCenter, dur);
 
         // ---- 标题 / 艺术家 ----
-        const int avail = qMax(20, r.right() - durWidth - textLeft - 6);
+        const int avail = qMax(20, r.right() - durWidth - tagWidth - textLeft - 6);
 
         const QFontMetrics fm(opt.font);
         const int twoLine = fm.height() + smallFm.height();
         const int top = r.top() + qMax(0, (r.height() - twoLine) / 2);
 
         p->setFont(opt.font);
-        p->setPen(playing ? QColor(0x53, 0x4A, 0xC0) : QColor(0x2C, 0x2C, 0x2A));
+        p->setPen(playing ? accentDeepColor() : UiTheme::color(UiTheme::TextStrong));
         const QString title = idx.data(TrackListModel::TitleRole).toString();
         p->drawText(QRect(textLeft, top, avail, fm.height()),
                     Qt::AlignLeft | Qt::AlignVCenter,
@@ -467,7 +502,7 @@ public:
             artist = QStringLiteral("未知艺术家");
 
         p->setFont(smallFont);
-        p->setPen(QColor(0x8A, 0x88, 0x80));
+        p->setPen(UiTheme::color(UiTheme::TextFaint));
         p->drawText(QRect(textLeft, top + fm.height(), avail, smallFm.height()),
                     Qt::AlignLeft | Qt::AlignVCenter,
                     smallFm.elidedText(artist, Qt::ElideRight, avail));
@@ -497,12 +532,17 @@ int lyricIndexAt(const QVector<TrackMeta::LyricLine>& lines, qint64 ms)
     return ans;
 }
 
-// 歌词高亮用的强调色（和样式表里那个 #7F77DD 是一套，深一档好压住灰底）
-const QColor kAccentDeep(0x53, 0x4A, 0xC0);
-
 // 歌词行距（100% 档位下的基准值）。实际用 UiFont::px() 按"界面字号"换算 ——
 // 字放大行距不跟着走的话，几行大字会挤成一坨。
 constexpr int kLyricSpacingBase = 10;
+
+// 歌词自动跟随的"暂停后恢复"时长。用户滚开歌词之后，闹钟清零重新计时 ——
+// 网易云是这个路数：滚的时候绝不抢，但也不永远撒手不管。
+constexpr int kLyricFollowResumeMs = 4000;
+
+// 当前行切换时滚动动画的时长。300ms 上下是主流播放器的手感：
+// 再快就看不出"滚"了（等于跳变），再慢就跟不上快节奏的歌。
+constexpr int kLyricScrollAnimMs = 320;
 
 // 歌词行的两种角色名（写在样式表里的，见 applyStyle）。
 // 用 objectName 而不是逐个 setStyleSheet 的原因见 highlightLyric()。
@@ -581,15 +621,52 @@ PlayerPage::PlayerPage(QWidget* parent) : QWidget(parent)
         applyMode();
     }
 
-    // 搜索防抖：停手 250ms 才真去搜
+    // 搜索防抖：停手 250ms 才真去搜本地
     m_searchTimer = new QTimer(this);
     m_searchTimer->setSingleShot(true);
     m_searchTimer->setInterval(250);
     connect(m_searchTimer, &QTimer::timeout, this, &PlayerPage::doSearch);
 
+    // 联网搜索防抖：独立 600ms（本地结果先出，联网结果随后追加，两不耽误）
+    m_onlineTimer = new QTimer(this);
+    m_onlineTimer->setSingleShot(true);
+    m_onlineTimer->setInterval(600);
+    connect(m_onlineTimer, &QTimer::timeout, this, [this] {
+        doOnlineSearch(m_searchEdit->text());
+    });
+
+    // ---- 联网功能的存储 ----
+    // 临时缓存（C 盘 %TEMP%/PetPalMusic）：启动先清上次残留（崩溃/强退漏下的），
+    // 本会话的临时文件在程序退出时由 main() 统一整删。
+    OnlineMusic::clearTempDir();
+    m_saveDir = QSettings(QSettings::IniFormat, QSettings::UserScope,
+                          QStringLiteral("PetPal"), QStringLiteral("ui"))
+                    .value(QStringLiteral("player/saveDir")).toString();
+
     // 初始视图：空查询 = 全部
     m_model->setView(m_lib->search(QString()));
     updateCountLabel();      // 顺带把"上一首 / 下一首"的可按状态刷成最新
+
+    // ---- 桌面歌词悬浮窗 ----
+    // 独立顶层窗口（不给 parent —— parent 给了this会跟着面板的什么属性走，
+    // 而它要的是"浮在桌面上"）。开不开由设置页的开关决定，那里也是存档所在。
+    m_dtLyricsEnabled = DesktopLyrics::loadEnabled();
+    m_desktopLyrics = new DesktopLyrics(nullptr);
+    m_desktopLyrics->hide();
+    m_desktopLyrics->setPlaying(m_player->isPlaying());
+    // 悬浮窗只做显示 + 播放控制：按钮发意图，真正动手的是这一页
+    //（它才有播放器和歌词数据）。三连击唤面板转给 DesktopPet。
+    connect(m_desktopLyrics, &DesktopLyrics::playPauseRequested,
+            this, &PlayerPage::togglePlayPause);
+    connect(m_desktopLyrics, &DesktopLyrics::prevRequested,
+            this, &PlayerPage::playPrev);
+    connect(m_desktopLyrics, &DesktopLyrics::nextRequested,
+            this, &PlayerPage::playNext);
+    connect(m_desktopLyrics, &DesktopLyrics::panelRequested,
+            this, &PlayerPage::desktopLyricsPanelRequested);
+    // 悬浮窗上的 ×：整个功能关掉（落盘 + 收窗），重开回设置页勾选
+    connect(m_desktopLyrics, &DesktopLyrics::closeRequested,
+            this, [this]() { setDesktopLyricsEnabled(false); });
 }
 
 PlayerPage::~PlayerPage() = default;
@@ -600,6 +677,22 @@ PlayerPage::~PlayerPage() = default;
 void PlayerPage::buildUi()
 {
     // ---------------- 工具行 ----------------
+    // 「我的收藏」切换按钮（收藏视图 / 全部列表）
+    m_favBtn = new QPushButton(QStringLiteral("我的收藏"), this);
+    m_favBtn->setObjectName(QStringLiteral("playerFav"));
+    m_favBtn->setCheckable(true);
+    m_favBtn->setCursor(Qt::PointingHandCursor);
+    m_favBtn->setToolTip(QStringLiteral("只看收藏过的歌（联网搜索里点右键收藏）"));
+    connect(m_favBtn, &QPushButton::toggled, this, &PlayerPage::showFavorites);
+
+    // 「我的下载」切换按钮（已下载/已收藏落盘的歌，可删除）
+    m_dlBtn = new QPushButton(QStringLiteral("我的下载"), this);
+    m_dlBtn->setObjectName(QStringLiteral("playerFav"));   // 和我的收藏同款样式
+    m_dlBtn->setCheckable(true);
+    m_dlBtn->setCursor(Qt::PointingHandCursor);
+    m_dlBtn->setToolTip(QStringLiteral("只看下载到本地的歌（列表里右键可删除）"));
+    connect(m_dlBtn, &QPushButton::toggled, this, &PlayerPage::showDownloads);
+
     m_pickBtn = new QPushButton(QStringLiteral("选文件夹"), this);
     m_pickBtn->setObjectName(QStringLiteral("playerPick"));
     m_pickBtn->setCursor(Qt::PointingHandCursor);
@@ -618,6 +711,8 @@ void PlayerPage::buildUi()
     auto* tools = new QHBoxLayout;
     tools->setContentsMargins(0, 0, 0, 0);
     tools->setSpacing(8);
+    tools->addWidget(m_favBtn);
+    tools->addWidget(m_dlBtn);
     tools->addWidget(m_pickBtn);
     tools->addWidget(m_searchEdit, 1);
     tools->addWidget(m_countLabel);
@@ -635,6 +730,11 @@ void PlayerPage::buildUi()
     m_list->setFrameShape(QFrame::NoFrame);
     connect(m_list, &QListView::activated, this, &PlayerPage::onRowActivated);
 
+    // 右键行菜单：收藏 / 仅下载（联网行），收藏（本地行）
+    m_list->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_list, &QWidget::customContextMenuRequested,
+            this, &PlayerPage::onListMenu);
+
     // ---------------- 右：歌词 ----------------
     m_lyricHeader = new QLabel(QStringLiteral("歌词"), this);
     m_lyricHeader->setObjectName(QStringLiteral("playerLyricHeader"));
@@ -651,6 +751,40 @@ void PlayerPage::buildUi()
     m_lyricScroll->setWidgetResizable(true);
     m_lyricScroll->setFrameShape(QFrame::NoFrame);
     m_lyricScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+
+    // ---- 歌词平滑滚动（网易云那套）----
+    // 缓动动画骑在滚动条的 value 属性上；滚轮/拖滑条是"用户接管"信号。
+    m_lyricAnim = new QPropertyAnimation(m_lyricScroll->verticalScrollBar(),
+                                         "value", this);
+    m_lyricAnim->setDuration(kLyricScrollAnimMs);
+    m_lyricAnim->setEasingCurve(QEasingCurve::OutCubic);
+
+    // ★ 用户接管的三个入口，一个都不能漏 ★
+    //   滚轮（事件过滤器抓 viewport 和滚动条自己的滚轮）、拖滑条把手
+    //   （sliderMoved）、点滑条凹槽翻页（actionTriggered）。
+    //   刻意**不**连 valueChanged —— 动画 setValue 也会发它，那样自己会把自己
+    //   判成"用户在滚"，永远暂停。
+    m_lyricScroll->viewport()->installEventFilter(this);
+    m_lyricScroll->verticalScrollBar()->installEventFilter(this);
+    connect(m_lyricScroll->verticalScrollBar(), &QScrollBar::sliderMoved,
+            this, [this]() { pauseLyricFollow(); });
+    connect(m_lyricScroll->verticalScrollBar(), &QScrollBar::actionTriggered,
+            this, [this]() { pauseLyricFollow(); });
+
+    m_lyricFollowTimer = new QTimer(this);
+    m_lyricFollowTimer->setSingleShot(true);
+    m_lyricFollowTimer->setInterval(kLyricFollowResumeMs);
+    connect(m_lyricFollowTimer, &QTimer::timeout, this, &PlayerPage::resumeLyricFollow);
+
+    // 「回到当前歌词」：悬浮在歌词区上（子控件放在 QScrollArea 而不是 viewport 上，
+    // 才不会被内容滚走）。平时藏着，用户滚开歌词时才浮现 —— 网易云同款。
+    m_lyricRecenterBtn = new QPushButton(QStringLiteral("回到当前歌词"), m_lyricScroll);
+    m_lyricRecenterBtn->setObjectName(QStringLiteral("lyricRecenter"));
+    m_lyricRecenterBtn->setCursor(Qt::PointingHandCursor);
+    m_lyricRecenterBtn->hide();
+    m_lyricRecenterBtn->raise();
+    connect(m_lyricRecenterBtn, &QPushButton::clicked,
+            this, &PlayerPage::resumeLyricFollow);
 
     clearLyrics(QStringLiteral("还没有在放歌"));
 
@@ -761,6 +895,55 @@ void PlayerPage::buildUi()
     root->setContentsMargins(14, 10, 14, 12);
     root->setSpacing(10);
     root->addLayout(tools);
+
+    // ---------------- 曲源选择行（在「我的收藏」正下方）----------------
+    // 网易云 / B 站二选一：网易云模式搜不到会自动转 B 站接档；B 站模式只搜 B 站。
+    // 选择记进 ui.ini，下次启动保持。
+    auto* srcRow = new QHBoxLayout;
+    srcRow->setContentsMargins(0, 2, 0, 0);
+    srcRow->setSpacing(6);
+
+    auto* srcCap = new QLabel(QStringLiteral("曲源"), this);
+    srcCap->setObjectName(QStringLiteral("playerCount"));
+    srcRow->addWidget(srcCap);
+
+    m_srcNetease = new QPushButton(QStringLiteral("网易云"), this);
+    m_srcNetease->setObjectName(QStringLiteral("playerFav"));
+    m_srcNetease->setCheckable(true);
+    m_srcNetease->setCursor(Qt::PointingHandCursor);
+
+    m_srcBili = new QPushButton(QStringLiteral("B站"), this);
+    m_srcBili->setObjectName(QStringLiteral("playerFav"));
+    m_srcBili->setCheckable(true);
+    m_srcBili->setCursor(Qt::PointingHandCursor);
+
+    // 默认网易云（历史行为）；存档里有就按存档来
+    m_onlineSource = QSettings(QSettings::IniFormat, QSettings::UserScope,
+                               QStringLiteral("PetPal"), QStringLiteral("ui"))
+                         .value(QStringLiteral("player/onlineSource"), 0).toInt() == 1
+                         ? 1 : 0;
+    m_srcNetease->setChecked(m_onlineSource == 0);
+    m_srcBili->setChecked(m_onlineSource == 1);
+
+    auto* srcGroup = new QButtonGroup(this);   // 默认互斥：同一时间只有一个曲源
+    srcGroup->addButton(m_srcNetease, 0);
+    srcGroup->addButton(m_srcBili, 1);
+    connect(srcGroup, &QButtonGroup::idClicked, this, [this](int id) {
+        if (id == m_onlineSource)
+            return;                            // 重复点同一个：什么都不做
+        m_onlineSource = id;
+        QSettings(QSettings::IniFormat, QSettings::UserScope,
+                  QStringLiteral("PetPal"), QStringLiteral("ui"))
+            .setValue(QStringLiteral("player/onlineSource"), id);
+        doOnlineSearch(m_searchEdit->text());  // 切曲源 = 立刻用当前关键词重搜
+    });
+
+    srcRow->addWidget(m_srcNetease);
+    srcRow->addWidget(m_srcBili);
+    srcRow->addStretch();
+
+    root->addLayout(srcRow);
+
     root->addLayout(middle, 1);
     root->addLayout(bar);
 
@@ -783,7 +966,7 @@ void PlayerPage::buildUi()
 // =============================================================================
 void PlayerPage::applyStyle()
 {
-    // 只替换 %1（歌词强调色），色值取自 kAccentDeep，不在这里再抄一遍
+    // 只替换 %1（歌词强调色），色值取自 accentDeepColor()，不在这里再抄一遍
     const QString qss = QStringLiteral(R"(
         QPushButton#playerPick {
             border: none; border-radius: 6px; padding: 6px 14px;
@@ -791,6 +974,15 @@ void PlayerPage::applyStyle()
         }
         QPushButton#playerPick:hover   { background: #6E65D6; }
         QPushButton#playerPick:pressed { background: #5F57C8; }
+
+        /* 我的收藏切换按钮：平时白底细边，选中（收藏视图）浅强调底 */
+        QPushButton#playerFav {
+            border: 1px solid #E3E1D9; border-radius: 6px;
+            background: #FFFFFF; color: #2C2C2A;
+            padding: 6px 10px; font-size: 12px;
+        }
+        QPushButton#playerFav:hover   { border-color: #7F77DD; color: #534AB7; }
+        QPushButton#playerFav:checked { background: #EEEDFE; color: #534AB7; border-color: #7F77DD; }
 
         QLineEdit#playerSearch {
             border: 1px solid #E3E1D9; border-radius: 6px;
@@ -805,6 +997,39 @@ void PlayerPage::applyStyle()
             background: transparent; border: none; outline: none;
         }
         QListView#playerList::item { border: none; }
+
+        /* 曲目列表和歌词区的滚动条统一成细圆条 —— 原生那根大灰条又宽又方，
+           在歌词这种窄栏里尤其压手。两处规则完全一致，看着才像一套东西。
+           色值是默认主题的字面量，会被 UiTheme 网关按当前主题换色。 */
+        QListView#playerList QScrollBar:vertical,
+        QScrollArea#playerLyric QScrollBar:vertical {
+            background: transparent; width: 8px; margin: 2px;
+        }
+        QListView#playerList QScrollBar::handle:vertical,
+        QScrollArea#playerLyric QScrollBar::handle:vertical {
+            background: #D3D1C7; border-radius: 3px; min-height: 30px;
+        }
+        QListView#playerList QScrollBar::handle:vertical:hover,
+        QScrollArea#playerLyric QScrollBar::handle:vertical:hover {
+            background: #B9B7AE;
+        }
+        QListView#playerList QScrollBar::add-line:vertical,
+        QScrollArea#playerLyric QScrollBar::add-line:vertical,
+        QListView#playerList QScrollBar::sub-line:vertical,
+        QScrollArea#playerLyric QScrollBar::sub-line:vertical { height: 0; }
+        QListView#playerList QScrollBar::add-page:vertical,
+        QScrollArea#playerLyric QScrollBar::add-page:vertical,
+        QListView#playerList QScrollBar::sub-page:vertical,
+        QScrollArea#playerLyric QScrollBar::sub-page:vertical { background: transparent; }
+
+        /* 「回到当前歌词」悬浮按钮：歌词被手动滚开时浮现（网易云那套）。
+           底色比卡片实一点，别让底下的歌词字透上来搅成一团。 */
+        QPushButton#lyricRecenter {
+            background: #FFFFFF; color: #534AB7;
+            border: 1px solid #AFA9EC; border-radius: 13px;
+            padding: 5px 14px; font-size: 12px;
+        }
+        QPushButton#lyricRecenter:hover { background: #EEEDFE; }
 
         QLabel#playerLyricHeader {
             color: #888780; font-size: 12px; padding-left: 2px;
@@ -878,7 +1103,7 @@ void PlayerPage::applyStyle()
             width: 9px; height: 9px; margin: -3px 0;
             border-radius: 4px; background: #9C95E6;
         }
-    )").arg(kAccentDeep.name());
+    )").arg(accentDeepColor().name());
 
     setStyleSheet(UiFont::styleSheet(qss));
 }
@@ -917,13 +1142,15 @@ void PlayerPage::paintEvent(QPaintEvent* event)
     {
         // KeepAspectRatioByExpanding：等比放大到铺满，多出来的边裁掉。
         // 用 Stretch 会把封面拉变形，宁可裁。
-        // ★ 这里刻意用**最近邻**（FastTransformation），不是平滑 ★
-        //   这张图只以 13% 的不透明度垫在文字后面（见下面 setOpacity），
-        //   平滑与否肉眼完全看不出来；但它是在 resizeEvent 里算的 —— 拖窗口边缘时
-        //   resizeEvent 会连着来上百次，每次都做平滑重缩就是"拉窗口一顿一顿"的来源。
-        //   宁可糙一点也要跟手，反正最后看到的是那层淡到几乎看不见的底。
+        // ★ 平滑插值（SmoothTransformation），别用最近邻 ★
+        //   曾经为了 resize 跟手刻意用最近邻（拖窗口边缘一次拖动会来上百次
+        //   resize，当时怕平滑缩放拖慢）——但源图已经预先缩到 ≤1280（见
+        //   loadLyricsAndCover / themeFallbackCover），从这里平滑缩到窗口尺寸
+        //   只有一两毫秒，完全在每帧预算内；而最近邻扔像素带来的锯齿和马赛克
+        //   是肉眼实打实看得见的。清晰度归清晰度，透明度归透明度 —— 这层图
+        //   只该淡，不该糊。
         m_bgCache = m_bgCover.scaled(size(), Qt::KeepAspectRatioByExpanding,
-                                     Qt::FastTransformation);
+                                     Qt::SmoothTransformation);
         m_bgCacheSize = size();
     }
 
@@ -944,6 +1171,23 @@ void PlayerPage::resizeEvent(QResizeEvent* event)
 void PlayerPage::showEvent(QShowEvent* event)
 {
     QWidget::showEvent(event);
+
+    // 切回播放器页时，把当前歌词行对到可视区中间。
+    // ★ 瞬时定位，不走动画 ★ —— 页面刚出现就自己滚两下很晃眼。
+    // ★ 用 singleShot(0) 推到布局落定之后 ★ —— showEvent 这会儿 viewport
+    //   高度还是旧的，直接算会偏。
+    if (m_lyricFollow && m_lyricCurrent >= 0 && m_lyricCurrent < m_lyricLabels.size())
+    {
+        QTimer::singleShot(0, this, [this]() {
+            if (!m_lyricFollow || m_lyricCurrent < 0
+                || m_lyricCurrent >= m_lyricLabels.size())
+                return;
+            if (QLayout* lay = m_lyricHost->layout())
+                lay->activate();
+            m_lyricScroll->verticalScrollBar()->setValue(
+                lyricTargetValue(m_lyricLabels.at(m_lyricCurrent)));
+        });
+    }
 
     // "上次那个文件夹"只自动加载一次。
     // 为什么不是每次切到这一页都重扫：几万首的库扫一遍要好几秒，
@@ -984,6 +1228,7 @@ void PlayerPage::onScanStarted()
     clearLyrics(QStringLiteral("还没有在放歌"));
     m_bgCover = QPixmap();
     m_bgCache = QPixmap();
+    m_coverFromTheme = false;         // 兜底状态一并清掉，别让之后的 refresh 误以为还在垫图
     update();
 
     m_countLabel->setText(QStringLiteral("正在扫描…"));
@@ -1039,11 +1284,25 @@ void PlayerPage::updateCountLabel()
 // =============================================================================
 void PlayerPage::onSearchChanged()
 {
-    m_searchTimer->start();            // 防抖：连打十个字只搜一次
+    m_searchTimer->start();            // 防抖：连打十个字只搜一次本地
+    m_onlineTimer->start();            // 联网搜索独立 600ms 防抖（结果追加在本地之后）
 }
 
 void PlayerPage::doSearch()
 {
+    // 打了新词 = 离开收藏/下载视图（这两个只是视图开关，不打断浏览）
+    if (m_favView || m_dlView)
+    {
+        m_favView = false;
+        m_dlView  = false;
+        m_favBtn->blockSignals(true);
+        m_favBtn->setChecked(false);
+        m_favBtn->blockSignals(false);
+        m_dlBtn->blockSignals(true);
+        m_dlBtn->setChecked(false);
+        m_dlBtn->blockSignals(false);
+    }
+
     m_model->setView(m_lib->search(m_searchEdit->text()));
     updateCountLabel();
 }
@@ -1053,6 +1312,12 @@ void PlayerPage::doSearch()
 // =============================================================================
 void PlayerPage::onRowActivated(const QModelIndex& index)
 {
+    // 联网行：下载 → （B站还要 MF 转码）→ 播放；本地行：照旧
+    if (m_model->isOnlineRow(index.row()))
+    {
+        playOnlineRow(index.row());
+        return;
+    }
     playRow(index.row());
 }
 
@@ -1070,7 +1335,23 @@ void PlayerPage::playLibraryIndex(int libIndex)
         return;
 
     QString err;
-    if (!m_player->load(t->path, &err))
+    bool loadOk = false;
+    if (t->path.startsWith(QStringLiteral("http")))
+    {
+        // 联网行（流式播放，不落盘）：Referer 按域名给
+        QUrl u(t->path);
+        QMap<QString, QString> headers;
+        headers.insert(QStringLiteral("Referer"),
+                       u.host().contains(QStringLiteral("163"))
+                           ? QStringLiteral("https://music.163.com")
+                           : QStringLiteral("https://www.bilibili.com"));
+        loadOk = m_player->loadOnline(u, t->durationMs, headers, &err);
+    }
+    else
+    {
+        loadOk = m_player->load(t->path, &err);
+    }
+    if (!loadOk)
     {
         // 播不了就明说（多半是格式不支持），别一声不吭 —— 用户会以为程序坏了
         m_nowLabel->setText(QStringLiteral("%1：%2").arg(t->title, err));
@@ -1092,6 +1373,50 @@ void PlayerPage::playLibraryIndex(int libIndex)
     loadLyricsAndCover(t->path);
     updateNowPlaying();
     m_player->play();
+
+    // 换歌事实成立：报出去（桌面歌词报歌名用）。暂停/恢复/seek 不走这条路。
+    emit currentTrackChanged(t->title);
+}
+
+// =============================================================================
+//  拖到桌宠身上的音乐文件：入列并立即播放
+//
+//  注入走 MusicLibrary::appendBatch —— 扫描线程的批次也从它过（ queued 回
+//  主线程执行），这里复用同一条路，不另开后门；debugInjectTracks 是先例。
+//  元数据用 TrackMeta::readMeta 现读（和"点了这首才读"是同一个原则），
+//  durationMs 读不到就先 0（列表显示 "--:--"，播放时进度条自己会拿到真时长）。
+// =============================================================================
+void PlayerPage::playDroppedFiles(const QStringList& paths)
+{
+    const int firstLib = m_lib->count();
+
+    QVector<Track> tracks;
+    for (const QString& path : paths)
+    {
+        if (!QFileInfo::exists(path))
+            continue;
+
+        const TrackMeta::Meta meta = TrackMeta::readMeta(path);
+        Track t;
+        t.path       = path;
+        t.title      = meta.title.isEmpty() ? QFileInfo(path).completeBaseName()
+                                            : meta.title;
+        t.artist     = meta.artist;
+        t.durationMs = meta.durationMs;
+        t.hasLyrics  = !meta.lyrics.isEmpty();
+        t.hasCover   = meta.hasCover();
+        tracks.append(t);
+    }
+
+    if (tracks.isEmpty())
+        return;                            // 一个能用的都没有：什么都不发生
+
+    m_lib->appendBatch(tracks);
+    m_searchEdit->clear();                 // 清掉过滤词，新歌才在列表里看得见
+    doSearch();
+    updateCountLabel();
+
+    playLibraryIndex(firstLib);            // 从拖进来的第一首开始放
 }
 
 void PlayerPage::playPrev()
@@ -1266,6 +1591,10 @@ void PlayerPage::onPlayerStateChanged()
     m_playBtn->setKind(playing ? PlayIconKind::Pause : PlayIconKind::Play);
     m_playBtn->setToolTip(playing ? QStringLiteral("暂停") : QStringLiteral("播放"));
 
+    // 桌面歌词工具条上的播放键图标同步
+    if (m_desktopLyrics)
+        m_desktopLyrics->setPlaying(playing);
+
     updateNowPlaying();
 }
 
@@ -1296,15 +1625,20 @@ void PlayerPage::loadLyricsAndCover(const QString& path)
     //   所有"重"的数据都是等用户真的点了这一首才读的 —— 这就是几万首也不卡的原因。
     const TrackMeta::Meta meta = TrackMeta::readMeta(path);
 
-    // 封面：先缩到 640 以内再留着当背景，免得每次重绘都在缩一张两三千像素的原图
+    // 封面：先缩到 1280 以内再留着当背景。★ 别贪小压到 640 ★ —— 铺满屏幕时
+    // 窗口宽约 1920，源图只有 640 的话必然放大 3 倍，再平滑也会发虚；1280 的源
+    // 配上 paintEvent 里的平滑缩放，最大化也够清晰。免得每次重绘都缩原图，所以
+    // 保留预缩这一步（重绘用的是缓存，见 paintEvent）。1280² 的 pixmap 约 6.5MB，
+    // 只留当前这一首，可以接受。
     if (meta.hasCover())
     {
         QImage img;
         img.loadFromData(meta.cover);
         if (!img.isNull())
         {
-            if (img.width() > 640 || img.height() > 640)
-                img = img.scaled(640, 640, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            m_coverFromTheme = false;      // 这首有自己的封面，主题图靠边站
+            if (img.width() > 1280 || img.height() > 1280)
+                img = img.scaled(1280, 1280, Qt::KeepAspectRatio, Qt::SmoothTransformation);
             m_bgCover = QPixmap::fromImage(img);
             m_coverLabel->setPixmap(m_bgCover.scaled(m_coverLabel->size(),
                                                      Qt::KeepAspectRatioByExpanding,
@@ -1313,14 +1647,12 @@ void PlayerPage::loadLyricsAndCover(const QString& path)
         }
         else
         {
-            m_bgCover = QPixmap();
-            m_coverLabel->setText(QStringLiteral("\u266B"));
+            applyFallbackCover();          // 封面数据坏了 —— 当作没有，走兜底
         }
     }
     else
     {
-        m_bgCover = QPixmap();
-        m_coverLabel->setText(QStringLiteral("\u266B"));   // ♫
+        applyFallbackCover();              // 没有内嵌封面 —— 拿主题背景图顶上
     }
     update();                              // 背景要重画
 
@@ -1354,6 +1686,68 @@ void PlayerPage::loadLyricsAndCover(const QString& path)
     }
 }
 
+// =============================================================================
+//  主题图兜底
+//
+//  这首歌没有内嵌封面（或者封面数据是坏的）时，拿用户在主题设置里导入的
+//  背景图垫上 —— 44px 的小封面和整页的淡化背景都来自同一张（m_bgCover），
+//  所以"换一张"只需要换 m_bgCover 一处。
+//  有内嵌封面的歌照走原路（见 loadLyricsAndCover），主题图绝不掺和。
+// =============================================================================
+void PlayerPage::applyFallbackCover()
+{
+    m_coverFromTheme = true;           // 现在垫的是主题图 —— 它换了要跟着换
+
+    m_bgCover = themeFallbackCover();
+    if (m_bgCover.isNull())
+    {
+        m_coverLabel->setText(QStringLiteral("\u266B"));   // 连主题图都没设 → 回到 ♫ 占位
+    }
+    else
+    {
+        m_coverLabel->setPixmap(m_bgCover.scaled(m_coverLabel->size(),
+                                                 Qt::KeepAspectRatioByExpanding,
+                                                 Qt::SmoothTransformation));
+    }
+    m_bgCacheSize = QSize();           // 整页背景的铺满缓存一并作废
+}
+
+// 读主题背景图，缩到和内嵌封面同一个量级（1280 以内，理由见 loadLyricsAndCover）。
+// ★ 按路径缓存 ★ 主题图不随换歌重来；路径变了（导入新图/清空）才重新读盘。
+QPixmap PlayerPage::themeFallbackCover()
+{
+    const QString path = UiTheme::bgImagePath();
+    if (path.isEmpty() || !QFile::exists(path))
+        return QPixmap();
+
+    if (path != m_themeCoverPath || m_themeCover.isNull())
+    {
+        QImage img(path);
+        if (img.isNull())
+            return QPixmap();          // 读不出来就空着，下次再试（不缓存失败结果）
+
+        if (img.width() > 1280 || img.height() > 1280)
+            img = img.scaled(1280, 1280, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        m_themeCover     = QPixmap::fromImage(img);
+        m_themeCoverPath = path;
+    }
+    return m_themeCover;
+}
+
+void PlayerPage::refreshFallbackCover()
+{
+    // 只有正垫着主题图的歌才需要跟进。两个提前返回：
+    //   · 这首有自己的封面（m_coverFromTheme == false）—— 主题图换谁的事都跟它无关；
+    //   · 路径没变（比如只是拖了不透明度滑条）—— 图一模一样，别白刷一遍。
+    if (!m_coverFromTheme)
+        return;
+    if (m_themeCoverPath == UiTheme::bgImagePath())
+        return;
+
+    applyFallbackCover();
+    update();
+}
+
 void PlayerPage::rebuildLyricLabels(const QVector<TrackMeta::LyricLine>& lines)
 {
     clearLyrics(QString());
@@ -1372,16 +1766,39 @@ void PlayerPage::rebuildLyricLabels(const QVector<TrackMeta::LyricLine>& lines)
         // 插在最后的 stretch 之前
         m_lyricLay->insertWidget(m_lyricLay->count() - 1, lab);
         m_lyricLabels.append(lab);
+
+        // 有时间戳的行可以双击跳进度（见 seekToLyric）—— 手型光标给个暗示。
+        // ★ 过滤器必须装在每一行上 ★ eventFilter 里判的是"watched 是哪一行"，
+        // 上一版就是漏了这行 installEventFilter，双击事件压根到不了处理逻辑。
+        if (line.timeMs >= 0)
+        {
+            lab->setCursor(Qt::PointingHandCursor);
+            lab->installEventFilter(this);
+        }
     }
 
     m_lyricCurrent = -1;
     m_lyricHeader->setText(QStringLiteral("歌词 · %1 行").arg(lines.size()));
+
+    // 新歌装好了但还没唱到第一句 —— 悬浮窗先收着，唱到第一行再出
+    updateDesktopLyrics();
 }
 
 void PlayerPage::clearLyrics(const QString& message)
 {
     m_lyricLines.clear();
     m_lyricCurrent = -1;
+
+    // 换歌/清空 = 滚动状态一并归零：恢复自动跟随、停动画、收按钮、回到顶部。
+    // （clearLyrics 在构造里也会被调一次，那时动画/按钮还没建，判空挡一下。）
+    if (m_lyricAnim)
+        m_lyricAnim->stop();
+    if (m_lyricFollowTimer)
+        m_lyricFollowTimer->stop();
+    if (m_lyricRecenterBtn)
+        m_lyricRecenterBtn->hide();
+    m_lyricFollow = true;
+    m_lyricScroll->verticalScrollBar()->setValue(0);
 
     // 删掉除"末尾那根 stretch"以外的全部控件
     while (m_lyricLay->count() > 1)
@@ -1401,6 +1818,9 @@ void PlayerPage::clearLyrics(const QString& message)
         m_lyricLay->insertWidget(0, lab);
         m_lyricHeader->setText(QStringLiteral("歌词"));
     }
+
+    // 换歌/清空 = 桌面歌词一并收起来（updateDesktopLyrics 会喂空 → 隐藏）
+    updateDesktopLyrics();
 }
 
 void PlayerPage::highlightLyric(int index)
@@ -1424,8 +1844,200 @@ void PlayerPage::highlightLyric(int index)
     if (QLayout* lay = m_lyricHost->layout())
         lay->activate();
 
-    // 滚到可视区中间 —— ensureWidgetVisible 的 yMargin 给一半高度就够了
-    m_lyricScroll->ensureWidgetVisible(cur, 0, m_lyricScroll->viewport()->height() / 2);
+    // ★ 跟随中才滚，而且滚是"缓动滚过去"，不是跳过去 ★
+    //   用户正手动翻歌词时（m_lyricFollow == false）只高亮不抢滚动 ——
+    //   高亮照样一格格走，视图停在用户放的地方（网易云同款行为）。
+    if (m_lyricFollow)
+        animateLyricTo(lyricTargetValue(cur));
+
+    // 桌面歌词跟着换行（开着的话）；没开着时 setLine 是空操作
+    updateDesktopLyrics();
+}
+
+// =============================================================================
+//  歌词平滑滚动
+// =============================================================================
+int PlayerPage::lyricTargetValue(QLabel* line) const
+{
+    // 当前行中心对齐可视区中心，收在滚动条行程内。
+    // 行的 y() 是相对 m_lyricHost 的 —— host 是 viewport 的 widget，
+    // 坐标和滚动值同系，直接算就行。
+    const QScrollBar* bar = m_lyricScroll->verticalScrollBar();
+    const int target = line->y() + line->height() / 2
+                       - m_lyricScroll->viewport()->height() / 2;
+    return qBound(0, target, bar->maximum());
+}
+
+void PlayerPage::animateLyricTo(int target)
+{
+    QScrollBar* bar = m_lyricScroll->verticalScrollBar();
+    if (bar->maximum() == 0)
+        return;                        // 内容还没超出一屏，没什么可滚的
+
+    if (qAbs(bar->value() - target) < 2)
+        return;                        // 已经在位上了，别为 1px 抖一下
+
+    // stop() 再 start()：行连续切换时从**当前值**接着滚，
+    // 不是每次都从旧行起点重滚一遍 —— 快歌连续换行时才顺滑。
+    m_lyricAnim->stop();
+    m_lyricAnim->setStartValue(bar->value());
+    m_lyricAnim->setEndValue(target);
+    m_lyricAnim->start();
+}
+
+void PlayerPage::pauseLyricFollow()
+{
+    if (m_lyricFollow)
+    {
+        m_lyricFollow = false;
+        m_lyricAnim->stop();           // 滚到一半被用户接手：动画立刻让位
+    }
+
+    // 已暂停时再滚：把"自动恢复"的闹钟往后推（从最后一次操作算起 4 秒）
+    if (m_lyricCurrent >= 0 && m_lyricScroll->verticalScrollBar()->maximum() > 0)
+        m_lyricRecenterBtn->setVisible(true);
+    m_lyricFollowTimer->start();
+}
+
+void PlayerPage::resumeLyricFollow()
+{
+    m_lyricFollowTimer->stop();
+    m_lyricRecenterBtn->hide();
+
+    if (m_lyricFollow)
+        return;                        // 本来就在跟着（比如 4 秒到了但用户已经点过按钮）
+
+    m_lyricFollow = true;
+
+    // 归位：滚回当前行。布局先 activate（高亮行字号变化的理由见 highlightLyric）
+    if (m_lyricCurrent >= 0 && m_lyricCurrent < m_lyricLabels.size())
+    {
+        if (QLayout* lay = m_lyricHost->layout())
+            lay->activate();
+        animateLyricTo(lyricTargetValue(m_lyricLabels.at(m_lyricCurrent)));
+    }
+}
+
+void PlayerPage::placeLyricRecenterBtn()
+{
+    if (!m_lyricRecenterBtn || !m_lyricScroll)
+        return;
+
+    const QSize sz = m_lyricRecenterBtn->sizeHint();
+    m_lyricRecenterBtn->setGeometry((m_lyricScroll->width()  - sz.width())  / 2,
+                                    m_lyricScroll->height() - sz.height() - 10,
+                                    sz.width(), sz.height());
+}
+
+bool PlayerPage::eventFilter(QObject* watched, QEvent* event)
+{
+    // 双击歌词行 = 跳到这一句。m_lyricLabels 里只存活着的行（clearLyrics 会
+    // 连人带名一起清），所以 indexOf 命中的必然是还活着的那个。
+    if (event->type() == QEvent::MouseButtonDblClick)
+    {
+        if (QLabel* lab = qobject_cast<QLabel*>(watched))
+        {
+            const int idx = m_lyricLabels.indexOf(lab);
+            if (idx >= 0)
+                seekToLyric(idx);
+        }
+    }
+    // 滚轮 = 用户要自己看歌词：暂停自动跟随。装在 viewport 和滚动条两处 ——
+    // 鼠标悬在滚动条上滚的时候，事件走的是滚动条，不过 viewport。
+    else if (event->type() == QEvent::Wheel
+        && (watched == m_lyricScroll->viewport()
+            || watched == m_lyricScroll->verticalScrollBar()))
+    {
+        pauseLyricFollow();
+    }
+    else if (watched == m_lyricScroll && event->type() == QEvent::Resize)
+    {
+        // 歌词区尺寸变了（拖面板/放大还原），悬浮按钮跟着挪
+        placeLyricRecenterBtn();
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+// =============================================================================
+//  桌面歌词
+// =============================================================================
+void PlayerPage::updateDesktopLyrics()
+{
+    if (!m_desktopLyrics || !m_player)
+        return;                        // 构造早期（buildUi 里的 clearLyrics）还没建
+
+    // ★ 显隐原则（对着网易云来的）★
+    //   · 开关关了 / 连歌都没加载 → 整窗隐藏（确实没什么可显示的）；
+    //   · 有歌但这首没有歌词 → 窗口留着，显示"暂无歌词"占位 —— 悬浮窗是
+    //     用户摆在桌面上的，一句没词就整窗消失、下一首有词又冒出来，
+    //     看着像坏了（这就是"切歌后桌面歌词没了"的原因）；
+    //   · 有歌词但还没唱到第一句 → 先把第一句垫在窗口上，唱到哪儿从哪儿换；
+    //   · 正常跟唱 → 当前行 + 下一行。
+    if (!m_dtLyricsEnabled || !m_player->hasTrack())
+    {
+        m_desktopLyrics->setLine(QString(), QString());
+        return;
+    }
+
+    if (m_lyricCurrent >= 0 && m_lyricCurrent < m_lyricLines.size())
+    {
+        QString next;
+        if (m_lyricCurrent + 1 < m_lyricLines.size())
+            next = m_lyricLines.at(m_lyricCurrent + 1).text;
+        m_desktopLyrics->setLine(m_lyricLines.at(m_lyricCurrent).text, next);
+        return;
+    }
+
+    if (!m_lyricLines.isEmpty())
+    {
+        QString next;
+        if (m_lyricLines.size() > 1)
+            next = m_lyricLines.at(1).text;
+        m_desktopLyrics->setLine(m_lyricLines.at(0).text, next);
+        return;
+    }
+
+    m_desktopLyrics->setLine(QStringLiteral("暂无歌词"), QString());
+}
+
+void PlayerPage::setDesktopLyricsEnabled(bool on)
+{
+    m_dtLyricsEnabled = on;
+    DesktopLyrics::saveEnabled(on);    // 立刻落盘 —— 和字号/主题一个规矩
+    updateDesktopLyrics();             // 开了就立刻按当前状态显示，不用等下一句
+
+    // 广播出去：设置页的勾选框要跟着同步（悬浮窗 × 关闭是反向路径）
+    emit desktopLyricsEnabledChanged(on);
+}
+
+// =============================================================================
+//  双击歌词跳进度
+// =============================================================================
+void PlayerPage::seekToLyric(int index)
+{
+    if (index < 0 || index >= m_lyricLines.size())
+        return;
+
+    const qint64 t = m_lyricLines.at(index).timeMs;
+    if (t < 0)
+        return;                        // 内嵌纯文本行没有时间戳，无处可跳
+
+    // 跳完这一句就是"当前句"—— 顺手把自动跟随恢复掉。
+    // 用户多半是先滚开歌词找到这一句的（正处于暂停跟随），这里直接置回跟随
+    // 而不是走 resumeLyricFollow()：后者会往**旧的**当前行滚，方向就反了。
+    // 置回后下面 highlightLyric 的缓动会自己滚向新当前行。
+    m_lyricFollow = true;
+    m_lyricFollowTimer->stop();
+    m_lyricRecenterBtn->hide();
+
+    m_player->seekToMs(t);             // 超出范围会被夹到 [0, 时长]（AudioPlayer 管）
+
+    // 界面立刻跟上，不等下一轮 positionChanged 轮询 ——
+    // 暂停状态下等它回报要干等一小会儿，双击就该"啪"地到位。
+    if (m_slider->value() != int(t))
+        m_slider->setValue(int(t));
+    m_posLabel->setText(formatMs(t));
+    highlightLyric(lyricIndexAt(m_lyricLines, t));
 }
 
 // =============================================================================
@@ -1997,4 +2609,764 @@ QString PlayerPage::describePlayer()
     }
 
     return out;
+}
+
+// =============================================================================
+//  联网搜索 / 收藏 / 我的收藏
+//
+//  两段式列表：本地行在前（标"本地"），联网结果追加在后（标"联网·网易 /
+//  联网·B站"）。双击联网行 = 下载到临时目录即点即听；右键 = 收藏 / 仅下载
+//  （存到用户选的储存盘，永久保留）。
+// =============================================================================
+
+// OnlineMusic::Item → 列表联网行的轻量副本（徽标带来源）
+static TrackListModel::OnlineTrack toOnlineRow(const OnlineMusic::Item& it)
+{
+    TrackListModel::OnlineTrack row;
+    row.id         = it.id;
+    row.source     = it.source;
+    row.title      = it.title;
+    row.artist     = it.artist;
+    row.album      = it.album;
+    row.durationMs = it.durationMs;
+    row.tag        = (it.source == OnlineMusic::Bilibili)
+                         ? QStringLiteral("联网·B站")
+                         : QStringLiteral("联网·网易");
+    return row;
+}
+
+// 下载的 Referer：两个平台都校验（缺了直接 403）
+static QMap<QString, QString> dlHeaders(int source)
+{
+    if (source == OnlineMusic::Bilibili)
+        return { { QStringLiteral("Referer"), QStringLiteral("https://www.bilibili.com") } };
+    return { { QStringLiteral("Referer"), QStringLiteral("https://music.163.com") } };
+}
+
+// 过滤掉"已经在库里的流式行"（同标题的直链条目）—— 同一首歌别显示两行。
+// 场景：双击播放后那首歌以"在线"库行存在，联网结果里再出现一次就是重复。
+static void dropAlreadyStreaming(QVector<TrackListModel::OnlineTrack>& rows,
+                                 const MusicLibrary* lib)
+{
+    rows.erase(std::remove_if(rows.begin(), rows.end(),
+                   [lib](const TrackListModel::OnlineTrack& r) {
+                       for (int i = 0; i < lib->count(); ++i)
+                       {
+                           const Track* t = lib->trackAt(i);
+                           if (t && t->path.startsWith(QStringLiteral("http"))
+                               && t->title == r.title)
+                               return true;   // 这首正在流式播/已在线：别再列一遍
+                       }
+                       return false;
+                   }),
+               rows.end());
+}
+
+// 网络错误串 → 短中文（Qt 的 errorString 是英文长句，徽标上放不下）
+static QString netErrText(const QString& raw)
+{
+    if (raw.contains(QLatin1String("timeout"), Qt::CaseInsensitive))
+        return QStringLiteral("超时");
+    if (raw.contains(QLatin1String("refused"), Qt::CaseInsensitive))
+        return QStringLiteral("连接被拒");
+    if (raw.contains(QLatin1String("host"), Qt::CaseInsensitive)
+        || raw.contains(QLatin1String("DNS"), Qt::CaseInsensitive))
+        return QStringLiteral("找不到服务器");
+    if (raw.contains(QLatin1String("canceled"), Qt::CaseInsensitive)
+        || raw.contains(QLatin1String("abort"), Qt::CaseInsensitive))
+        return QStringLiteral("已取消");
+    if (raw.contains(QLatin1String("SSL"), Qt::CaseInsensitive))
+        return QStringLiteral("SSL 错误");
+    if (raw.contains(QLatin1String("Temporary network failure"), Qt::CaseInsensitive)
+        || raw.contains(QLatin1String("network"), Qt::CaseInsensitive))
+        return QStringLiteral("网络不可用");
+    return raw;                                // 没认出来的原样显示
+}
+
+void PlayerPage::doOnlineSearch(const QString& keyword)
+{
+    if (keyword.isEmpty())
+    {
+        m_model->clearOnlineResults();
+        return;
+    }
+    m_onlineKeyword = keyword;         // 词改了之后的过期回调在这里丢弃
+
+    // ---- B 站模式：只搜 B 站（综合排序前 10）----
+    if (m_onlineSource == 1)
+    {
+        OnlineMusic::searchBilibili(keyword,
+            [this, keyword](const QVector<OnlineMusic::Item>& items) {
+                if (keyword != m_onlineKeyword)
+                    return;
+                QVector<TrackListModel::OnlineTrack> rows;
+                for (const auto& it : items)
+                    rows.append(toOnlineRow(it));
+        dropAlreadyStreaming(rows, m_lib);
+                m_model->setOnlineResults(rows);
+            });
+        return;
+    }
+
+    // ---- 网易云模式（默认）：网易云优先，搜不到自动 B 站接档 ----
+    OnlineMusic::searchNetEase(keyword, [this, keyword](const QVector<OnlineMusic::Item>& items) {
+        if (keyword != m_onlineKeyword)
+            return;
+        if (items.isEmpty())
+        {
+            fallbackBilibili(keyword, m_saveDir, /*registerFav=*/false, /*play=*/false);
+            return;                    // 网易没搜到 → B 站搜同关键词
+        }
+        QVector<TrackListModel::OnlineTrack> rows;
+        for (const auto& it : items)
+            rows.append(toOnlineRow(it));
+        dropAlreadyStreaming(rows, m_lib);
+        m_model->setOnlineResults(rows);
+    });
+}
+
+// 网易搜不到 / 收费时的回退：B 站搜同关键词，结果替换联网区；
+// play = true 时（双击的那首收费）自动接档 B 站第一条。
+void PlayerPage::fallbackBilibili(const QString& keyword, const QString& dir,
+                                  bool registerFav, bool play)
+{
+    OnlineMusic::searchBilibili(keyword, [this, dir, registerFav, play](const QVector<OnlineMusic::Item>& items) {
+        QVector<TrackListModel::OnlineTrack> rows;
+        for (const auto& it : items)
+            rows.append(toOnlineRow(it));
+        dropAlreadyStreaming(rows, m_lib);
+        m_model->setOnlineResults(rows);
+
+        if (!rows.isEmpty() && play)
+            fetchAndPlay(m_model->localRowCount(), rows.first(), dir, registerFav, play);
+    });
+}
+
+void PlayerPage::playOnlineRow(int row)
+{
+    // 即点即听：下载到临时缓存（C 盘），退出时自动清除
+    fetchAndPlay(row, m_model->onlineAt(row), OnlineMusic::tempDir(),
+                 /*registerFav=*/false, /*play=*/true);
+}
+
+// =============================================================================
+//  联网行落地：下载 → （B站经 MF 转 WAV）→ 入库 → （可选收藏/播放）
+// =============================================================================
+void PlayerPage::fetchAndPlay(int row, const TrackListModel::OnlineTrack& it,
+                              const QString& dir, bool registerFav, bool play)
+{
+    // ★ 双击联网行（临时目录 + 播放）= 流式/就地播放，不刷新列表 ★
+    // 收藏 / 仅下载（储存盘）= 完整落盘，完成后刷新列表让新歌出现。
+    const bool refreshList = !(play && dir == OnlineMusic::tempDir());
+
+    auto setTag = [this, row](const QString& t) {
+        if (row >= 0)
+            m_model->setOnlineTag(row, t);
+    };
+
+    auto startDl = [this, row, it, dir, registerFav, play, refreshList, setTag](const QString& url,
+                                                                   const QString& suffix) {
+        const QString base = OnlineMusic::sanitizeFileName(
+            it.title + QStringLiteral(" - ") + it.artist);
+        const QString savePath = dir + QLatin1Char('/') + base + QLatin1Char('.') + suffix;
+
+        OnlineMusic::download(url, savePath, dlHeaders(it.source),
+            [this, row](qint64 got, qint64 total) {
+                if (total > 0 && row >= 0)
+                    m_model->setOnlineTag(row,
+                        QStringLiteral("下载中 %1%").arg(int(got * 100 / total)));
+            },
+            [this, it, row, savePath, dir, suffix, base, registerFav, play, refreshList, setTag]
+            (bool ok, const QString& err) {
+                if (!ok)
+                {
+                    setTag(QStringLiteral("联网失败·%1").arg(netErrText(err)));
+                    return;
+                }
+
+                // B 站：M4S(AAC) → Media Foundation → WAV（miniaudio 只认 MP3/FLAC/WAV）
+                if (suffix == QStringLiteral("m4s"))
+                {
+                    const QString wavPath = dir + QLatin1Char('/') + base + QStringLiteral(".wav");
+                    QString decodeErr;
+                    if (!MfDecode::decodeToWav(savePath, wavPath, &decodeErr))
+                    {
+                        setTag(QStringLiteral("该资源无法播放"));
+                        QFile::remove(savePath);
+                        return;
+                    }
+                    QFile::remove(savePath);           // 中间产物不留
+                    finishOnlineTrack(it, wavPath, dir, registerFav, play, refreshList);
+                    if (play && dir == OnlineMusic::tempDir())
+                        m_model->setPlayingOnlineId(it.id);   // B站行原地高亮（列表不刷）
+                    return;
+                }
+
+                // 网易：歌词顺路写成 .lrc 侧车（TrackMeta 读侧车，播放器零改动）
+                if (it.source == OnlineMusic::NetEase)
+                {
+                    OnlineMusic::netEaseLyric(it.id,
+                        [this, it, savePath, dir, registerFav, play, refreshList, setTag](const QString& lrc) {
+                            if (!lrc.isEmpty())
+                            {
+                                QFile f(QFileInfo(savePath).absolutePath() + QLatin1Char('/')
+                                        + QFileInfo(savePath).completeBaseName()
+                                        + QStringLiteral(".lrc"));
+                                if (f.open(QIODevice::WriteOnly))
+                                {
+                                    f.write(lrc.toUtf8());
+                                    f.close();
+                                }
+                            }
+                            finishOnlineTrack(it, savePath, dir, registerFav, play, refreshList);
+                        });
+                    return;
+                }
+
+                finishOnlineTrack(it, savePath, dir, registerFav, play, refreshList);
+            });
+    };
+
+    if (it.source == OnlineMusic::NetEase)
+    {
+        OnlineMusic::netEaseUrl(it.id,
+            [this, row, it, play, startDl](const QString& url, const QString& suffix) {
+                if (url.isEmpty())
+                {
+                    // VIP/无版权 → B 站搜同名自动接档
+                    fallbackBilibili(it.title + QStringLiteral(" ") + it.artist,
+                                     m_saveDir, /*registerFav=*/false, /*play=*/false);
+                    return;
+                }
+
+                // ★ 网易云：流式播放 —— 不落盘、不进曲库、列表原样 ★
+                // 高亮联网行（没有库行，就不会出现"同歌两行"）；
+                // 歌词异步拉 LRC 直接重建（流式没有本地文件可读侧车）。
+                if (play)
+                {
+                    m_model->setPlayingLibraryIndex(-1);   // 本地行高亮让位
+                    m_model->setPlayingOnlineId(it.id);    // 联网行点亮
+                    m_nowLabel->setText(it.title + QStringLiteral(" · ") + it.artist);
+
+                    QString err;
+                    if (!m_player->loadOnline(QUrl(url), it.durationMs,
+                                              dlHeaders(OnlineMusic::NetEase), &err))
+                    {
+                        m_nowLabel->setText(QStringLiteral("%1：%2").arg(it.title, err));
+                        return;
+                    }
+                    m_player->play();
+                    emit currentTrackChanged(it.title);
+
+                    OnlineMusic::netEaseLyric(it.id,
+                        [this, id = it.id](const QString& lrc) {
+                            if (lrc.isEmpty() || m_model->playingOnlineId() != id)
+                                return;          // 已经切歌：过期回调丢弃
+                            rebuildLyricLabels(TrackMeta::parseLrc(lrc));
+                        });
+                    return;
+                }
+
+                // 收藏 / 仅下载：完整下载到储存盘（进"我的下载"）
+                startDl(url, suffix);
+            });
+    }
+    else
+    {
+        OnlineMusic::bilibiliAudio(it.id,
+            [this, row, setTag, it, registerFav, play](const QString& url, const QString& suffix) {
+                if (url.isEmpty())
+                {
+                    setTag(QStringLiteral("该资源无法播放"));
+                    return;
+                }
+
+                // ★ B 站必须下载（AAC）→ 转好放进「我的下载」，下次直接读本地 ★
+                if (!ensureSaveDir())
+                {
+                    setTag(QStringLiteral("未选择保存文件夹"));
+                    return;
+                }
+
+                const QString base    = OnlineMusic::sanitizeFileName(
+                    it.title + QStringLiteral(" - ") + it.artist);
+                const QString wavPath = m_saveDir + QLatin1Char('/') + base + QStringLiteral(".wav");
+
+                // 下次再点同一首：本地已有转好的 WAV → 直接读它，不再下载
+                if (QFileInfo::exists(wavPath))
+                {
+                    playLocalWav(it, wavPath, registerFav, play);
+                    return;
+                }
+
+                const QString m4aPath = m_saveDir + QLatin1Char('/') + base + QStringLiteral(".m4a");
+                OnlineMusic::download(url, m4aPath, dlHeaders(OnlineMusic::Bilibili),
+                    [this, row](qint64 got, qint64 total) {
+                        if (total > 0 && row >= 0)
+                            m_model->setOnlineTag(row,
+                                QStringLiteral("下载中 %1%").arg(int(got * 100 / total)));
+                    },
+                    [this, it, row, m4aPath, wavPath, registerFav, play, setTag](bool ok, const QString& err) {
+                        if (!ok)
+                        {
+                            setTag(QStringLiteral("联网失败·%1").arg(netErrText(err)));
+                            return;
+                        }
+                        QString decodeErr;
+                        if (!MfDecode::decodeToWav(m4aPath, wavPath, &decodeErr))
+                        {
+                            setTag(QStringLiteral("该资源无法播放"));
+                            QFile::remove(m4aPath);
+                            return;
+                        }
+                        QFile::remove(m4aPath);            // 中间产物不留
+                        playLocalWav(it, wavPath, registerFav, play);
+                    });
+            });
+    }
+}
+
+// =============================================================================
+//  B 站落地后的播放：WAV 已在储存盘 → 入库（不广播）→ 播放 + 联网行高亮
+//
+//  ★ 下次再点同一首 B 站结果：wavPath 已存在 → 直接走这里读本地文件 ★
+//  不再下载、不再转码。
+// =============================================================================
+void PlayerPage::playLocalWav(const TrackListModel::OnlineTrack& it, const QString& wavPath,
+                              bool registerFav, bool play)
+{
+    int libIndex = m_lib->indexOfPath(wavPath);
+    if (libIndex < 0)
+    {
+        Track t;
+        t.path       = wavPath;
+        t.title      = it.title;
+        t.artist     = it.artist;
+        t.durationMs = it.durationMs;
+        libIndex = m_lib->count();
+        m_lib->appendBatch(QVector<Track>{ t }, false);   // 不广播：列表保持 B 站结果
+    }
+    m_model->setLibraryTag(libIndex,
+        registerFav ? QStringLiteral("收藏") : QStringLiteral("已下载"));
+    if (registerFav)
+        addFavorite(it.title, it.artist, wavPath);
+    addDownloaded(it.title, it.artist, wavPath);
+
+    if (play)
+    {
+        playLibraryIndex(libIndex);            // 本地 WAV 直接 load + play
+        m_model->setPlayingOnlineId(it.id);    // 联网行高亮补回（playLibraryIndex 清过）
+    }
+}
+
+void PlayerPage::finishOnlineTrack(const TrackListModel::OnlineTrack& it, const QString& path,
+                                   const QString& dir, bool registerFav, bool play,
+                                   bool refreshList)
+{
+    // ★ 先找"同一首歌"的现有库行 ★
+    //   ① 路径相同（重复下载/重复双击）；
+    //   ② 直链行且标题相同（流式播放中的那行 —— 下载完成后**就地转正**：
+    //      直链换成本地文件，不再另起一行，列表不会多出重复的一首）。
+    int libIndex = m_lib->indexOfPath(path);
+    if (libIndex < 0)
+    {
+        for (int i = 0; i < m_lib->count(); ++i)
+        {
+            const Track* t = m_lib->trackAt(i);
+            if (t && t->path.startsWith(QStringLiteral("http")) && t->title == it.title)
+            {
+                libIndex = i;
+                break;
+            }
+        }
+    }
+
+    if (libIndex < 0)
+    {
+        Track t;
+        t.path       = path;
+        t.title      = it.title;
+        t.artist     = it.artist;
+        t.durationMs = it.durationMs;
+        libIndex = m_lib->count();
+        m_lib->appendBatch(QVector<Track>{ t });
+    }
+    else
+    {
+        m_lib->updateTrackPath(libIndex, path);   // 流式直链 → 本地文件（就地转正）
+    }
+
+    // 徽标：收藏的标"收藏"，仅下载的标"已下载"，临时播放的标"在线"
+    const bool savedToDisk = (!m_saveDir.isEmpty() && dir == m_saveDir);
+    m_model->setLibraryTag(libIndex,
+        registerFav ? QStringLiteral("收藏")
+                    : (savedToDisk  ? QStringLiteral("已下载")
+                                    : QStringLiteral("在线")));
+
+    if (registerFav)
+        addFavorite(it.title, it.artist, path);
+    if (savedToDisk)
+        addDownloaded(it.title, it.artist, path);   // 收藏/仅下载都登记进"我的下载"
+
+    // ★ 刷新列表只发生在"落盘"的场合 ★ 流式/临时播放不刷 —— 联网结果保持
+    // 原样，正在播的那行高亮（setPlayingOnlineId 由调用方补一下）。
+    if (refreshList)
+    {
+        m_model->clearOnlineResults();     // 联网区的那行使命完成（歌已是本地行）
+        doSearch();
+    }
+
+    if (play)
+        playLibraryIndex(libIndex);
+}
+
+// =============================================================================
+//  收藏 / 我的收藏
+// =============================================================================
+void PlayerPage::addFavorite(const QString& title, const QString& artist, const QString& path)
+{
+    QSettings ini(QSettings::IniFormat, QSettings::UserScope,
+                  QStringLiteral("PetPal"), QStringLiteral("favorites"));
+    const int n = ini.beginReadArray(QStringLiteral("favorites"));
+    for (int i = 0; i < n; ++i)
+    {
+        ini.setArrayIndex(i);
+        if (ini.value(QStringLiteral("path")).toString() == path)
+        {
+            ini.endArray();
+            return;                    // 已经收藏过：不重复登记
+        }
+    }
+    ini.endArray();
+
+    ini.beginWriteArray(QStringLiteral("favorites"), n + 1);
+    ini.setArrayIndex(n);
+    ini.setValue(QStringLiteral("title"), title);
+    ini.setValue(QStringLiteral("artist"), artist);
+    ini.setValue(QStringLiteral("path"), path);
+    ini.endArray();
+}
+
+void PlayerPage::showFavorites(bool on)
+{
+    m_favView = on;
+    if (m_favBtn->isChecked() != on)
+    {
+        m_favBtn->blockSignals(true);
+        m_favBtn->setChecked(on);
+        m_favBtn->blockSignals(false);
+    }
+
+    // 收藏视图打开时收起下载视图（两个视图互斥，按钮状态也跟着走）
+    if (on && m_dlView)
+    {
+        m_dlView = false;
+        m_dlBtn->blockSignals(true);
+        m_dlBtn->setChecked(false);
+        m_dlBtn->blockSignals(false);
+    }
+
+    if (!on)
+    {
+        doSearch();
+        return;
+    }
+
+    // 读收藏索引：文件还在的进列表，丢了的自动剔除（循环后整组重写索引）
+    QSettings ini(QSettings::IniFormat, QSettings::UserScope,
+                  QStringLiteral("PetPal"), QStringLiteral("favorites"));
+    const int n = ini.beginReadArray(QStringLiteral("favorites"));
+
+    struct FavEntry
+    {
+        QString title, artist, path;
+    };
+    QVector<FavEntry> kept;
+    QVector<Track>    inject;
+    QVector<int>      view;
+    const int         base = m_lib->count();
+
+    for (int i = 0; i < n; ++i)
+    {
+        ini.setArrayIndex(i);
+        const QString path = ini.value(QStringLiteral("path")).toString();
+        if (!QFileInfo::exists(path))
+            continue;                  // 文件没了：剔除
+
+        int libIndex = m_lib->indexOfPath(path);
+        if (libIndex < 0)
+        {
+            // 文件在、但还没进过曲库：现读元数据补进来
+            const TrackMeta::Meta meta = TrackMeta::readMeta(path);
+            Track t;
+            t.path       = path;
+            t.title      = meta.title.isEmpty() ? QFileInfo(path).completeBaseName()
+                                                : meta.title;
+            t.artist     = meta.artist;
+            t.durationMs = meta.durationMs;
+            inject.append(t);
+            libIndex = base + inject.size() - 1;
+        }
+        view.append(libIndex);
+        kept.append({ ini.value(QStringLiteral("title")).toString(),
+                      ini.value(QStringLiteral("artist")).toString(), path });
+    }
+    ini.endArray();
+
+    if (!inject.isEmpty())
+        m_lib->appendBatch(inject);
+
+    ini.beginWriteArray(QStringLiteral("favorites"), kept.size());
+    for (int i = 0; i < kept.size(); ++i)
+    {
+        ini.setArrayIndex(i);
+        ini.setValue(QStringLiteral("title"), kept.at(i).title);
+        ini.setValue(QStringLiteral("artist"), kept.at(i).artist);
+        ini.setValue(QStringLiteral("path"), kept.at(i).path);
+    }
+    ini.endArray();
+
+    m_model->clearOnlineResults();
+    m_model->setView(view);
+    m_countLabel->setText(QStringLiteral("收藏 %1 首").arg(view.size()));
+}
+
+void PlayerPage::onListMenu(const QPoint& pos)
+{
+    const QModelIndex idx = m_list->indexAt(pos);
+    if (!idx.isValid())
+        return;
+    const int row = idx.row();
+
+    QMenu menu(this);
+    if (m_model->isOnlineRow(row))
+    {
+        menu.addAction(QStringLiteral("收藏"), this, [this, row] {
+            if (!ensureSaveDir())
+                return;                // 没选储存盘（或取消了）：本次不动
+            fetchAndPlay(row, m_model->onlineAt(row), m_saveDir,
+                         /*registerFav=*/true, /*play=*/false);
+        });
+        menu.addAction(QStringLiteral("仅下载"), this, [this, row] {
+            if (!ensureSaveDir())
+                return;
+            fetchAndPlay(row, m_model->onlineAt(row), m_saveDir,
+                         /*registerFav=*/false, /*play=*/false);
+        });
+    }
+    else if (m_dlView)
+    {
+        // 我的下载视图：右键删除（删文件 + 剔索引 + 出曲库）
+        const int libIndex = idx.data(TrackListModel::LibraryIndexRole).toInt();
+        menu.addAction(QStringLiteral("删除"), this, [this, libIndex] {
+            removeDownloaded(libIndex);
+        });
+    }
+    else
+    {
+        menu.addAction(QStringLiteral("收藏"), this, [this, idx] {
+            const QString path = idx.data(TrackListModel::PathRole).toString();
+            addFavorite(idx.data(TrackListModel::TitleRole).toString(),
+                        idx.data(TrackListModel::ArtistRole).toString(), path);
+        });
+    }
+    menu.exec(m_list->viewport()->mapToGlobal(pos));
+}
+
+bool PlayerPage::ensureSaveDir()
+{
+    if (!m_saveDir.isEmpty())
+        return true;
+
+    const QString dir = QFileDialog::getExistingDirectory(
+        this, QStringLiteral("选择音乐保存文件夹（收藏和下载都存这里）"), QString());
+    if (dir.isEmpty())
+        return false;                  // 用户取消：本次不动
+
+    m_saveDir = dir;
+    QSettings(QSettings::IniFormat, QSettings::UserScope,
+              QStringLiteral("PetPal"), QStringLiteral("ui"))
+        .setValue(QStringLiteral("player/saveDir"), dir);
+    return true;
+}
+
+// =============================================================================
+//  我的下载（仅下载 / 收藏落盘的歌都在这里；列表里右键可删除）
+// =============================================================================
+void PlayerPage::addDownloaded(const QString& title, const QString& artist, const QString& path)
+{
+    QSettings ini(QSettings::IniFormat, QSettings::UserScope,
+                  QStringLiteral("PetPal"), QStringLiteral("downloads"));
+    const int n = ini.beginReadArray(QStringLiteral("downloads"));
+    for (int i = 0; i < n; ++i)
+    {
+        ini.setArrayIndex(i);
+        if (ini.value(QStringLiteral("path")).toString() == path)
+        {
+            ini.endArray();
+            return;                    // 已经登记过：不重复
+        }
+    }
+    ini.endArray();
+
+    ini.beginWriteArray(QStringLiteral("downloads"), n + 1);
+    ini.setArrayIndex(n);
+    ini.setValue(QStringLiteral("title"), title);
+    ini.setValue(QStringLiteral("artist"), artist);
+    ini.setValue(QStringLiteral("path"), path);
+    ini.endArray();
+}
+
+void PlayerPage::showDownloads(bool on)
+{
+    m_dlView = on;
+    if (m_dlBtn->isChecked() != on)
+    {
+        m_dlBtn->blockSignals(true);
+        m_dlBtn->setChecked(on);
+        m_dlBtn->blockSignals(false);
+    }
+
+    // 下载视图打开时收起收藏视图（两个视图互斥）
+    if (on && m_favView)
+    {
+        m_favView = false;
+        m_favBtn->blockSignals(true);
+        m_favBtn->setChecked(false);
+        m_favBtn->blockSignals(false);
+    }
+
+    if (!on)
+    {
+        doSearch();
+        return;
+    }
+
+    // 读下载索引：文件还在的进列表，丢了的自动剔除（循环后整组重写索引）
+    QSettings ini(QSettings::IniFormat, QSettings::UserScope,
+                  QStringLiteral("PetPal"), QStringLiteral("downloads"));
+    const int n = ini.beginReadArray(QStringLiteral("downloads"));
+
+    struct DlEntry
+    {
+        QString title, artist, path;
+    };
+    QVector<DlEntry> kept;
+    QVector<Track>   inject;
+    QVector<int>     view;
+    const int        base = m_lib->count();
+
+    for (int i = 0; i < n; ++i)
+    {
+        ini.setArrayIndex(i);
+        const QString path = ini.value(QStringLiteral("path")).toString();
+        if (!QFileInfo::exists(path))
+            continue;                  // 文件没了：剔除
+
+        int libIndex = m_lib->indexOfPath(path);
+        if (libIndex < 0)
+        {
+            const TrackMeta::Meta meta = TrackMeta::readMeta(path);
+            Track t;
+            t.path       = path;
+            t.title      = meta.title.isEmpty() ? QFileInfo(path).completeBaseName()
+                                                : meta.title;
+            t.artist     = meta.artist;
+            t.durationMs = meta.durationMs;
+            inject.append(t);
+            libIndex = base + inject.size() - 1;
+        }
+        view.append(libIndex);
+        kept.append({ ini.value(QStringLiteral("title")).toString(),
+                      ini.value(QStringLiteral("artist")).toString(), path });
+    }
+    ini.endArray();
+
+    if (!inject.isEmpty())
+        m_lib->appendBatch(inject);
+
+    ini.beginWriteArray(QStringLiteral("downloads"), kept.size());
+    for (int i = 0; i < kept.size(); ++i)
+    {
+        ini.setArrayIndex(i);
+        ini.setValue(QStringLiteral("title"), kept.at(i).title);
+        ini.setValue(QStringLiteral("artist"), kept.at(i).artist);
+        ini.setValue(QStringLiteral("path"), kept.at(i).path);
+    }
+    ini.endArray();
+
+    m_model->clearOnlineResults();
+    m_model->setView(view);
+    m_countLabel->setText(QStringLiteral("下载 %1 首").arg(view.size()));
+}
+
+// 从索引文件里剔除某条路径（favorites / downloads 通用：数组名 = 文件名）
+static void pruneIndexFile(const QString& appName, const QString& path)
+{
+    QSettings ini(QSettings::IniFormat, QSettings::UserScope,
+                  QStringLiteral("PetPal"), appName);
+    const int n = ini.beginReadArray(appName);
+
+    struct Entry
+    {
+        QString title, artist, path;
+    };
+    QVector<Entry> kept;
+    for (int i = 0; i < n; ++i)
+    {
+        ini.setArrayIndex(i);
+        const QString p = ini.value(QStringLiteral("path")).toString();
+        if (p == path)
+            continue;
+        kept.append({ ini.value(QStringLiteral("title")).toString(),
+                      ini.value(QStringLiteral("artist")).toString(), p });
+    }
+    ini.endArray();
+
+    ini.beginWriteArray(appName, kept.size());
+    for (int i = 0; i < kept.size(); ++i)
+    {
+        ini.setArrayIndex(i);
+        ini.setValue(QStringLiteral("title"), kept.at(i).title);
+        ini.setValue(QStringLiteral("artist"), kept.at(i).artist);
+        ini.setValue(QStringLiteral("path"), kept.at(i).path);
+    }
+    ini.endArray();
+}
+
+void PlayerPage::removeDownloaded(int libIndex)
+{
+    const Track* t = m_lib->trackAt(libIndex);
+    if (!t)
+        return;
+    const QString path = t->path;
+
+    // 正在播这首 → 先停（文件都要删了，继续播没有意义）
+    if (m_playingLib == libIndex)
+    {
+        m_player->stop();
+        m_playingLib = -1;
+        m_model->setPlayingLibraryIndex(-1);
+        m_nowLabel->setText(QStringLiteral("没在放歌"));
+    }
+
+    // 删文件（.lrc 侧车一并）
+    QFile::remove(path);
+    QFile::remove(QFileInfo(path).absolutePath() + QLatin1Char('/')
+                  + QFileInfo(path).completeBaseName() + QStringLiteral(".lrc"));
+
+    // 剔索引（下载 + 收藏里同路径的条目）
+    pruneIndexFile(QStringLiteral("downloads"), path);
+    pruneIndexFile(QStringLiteral("favorites"), path);
+
+    // 出曲库（后面的下标整体前移，正在播的下标也要修）
+    m_lib->removeAt(libIndex);
+    if (m_playingLib > libIndex)
+    {
+        m_playingLib -= 1;
+        m_model->setPlayingLibraryIndex(m_playingLib);
+    }
+
+    // 重新载入下载视图（列表重建）
+    showDownloads(true);
 }

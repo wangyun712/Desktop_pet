@@ -14,6 +14,7 @@
 
 #include <QWidget>
 #include <QPoint>
+#include <QPixmap>
 #include <QRect>
 
 class QListWidget;
@@ -76,4 +77,10 @@ private:
     // 放大/还原用。放大前的几何要留着，还原时原样放回去。
     bool  m_maximized = false;
     QRect m_restoreGeometry;
+
+    // 背景图（UiTheme 里设置的那张）。★ 缓存 + 记路径 ★ 每帧去磁盘读大图太贵，
+    // 只在 paintEvent 发现"存档里的路径和上次加载的不一样"时才重新加载。
+    // 路径不存在时缓存为空图，画图那步自然跳过 —— 回落到纯主题色底。
+    QPixmap m_bgImg;
+    QString m_bgPath;
 };

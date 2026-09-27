@@ -45,6 +45,9 @@
 #include "MusicLibrary.h"
 #include "MainPanel.h"
 #include "UiFont.h"
+#include "UiTheme.h"
+#include "PetSay.h"
+#include "OnlineMusic.h"
 
 // -----------------------------------------------------------------------------
 //  --walktrace：把行走的播放顺序逐帧打出来。
@@ -523,6 +526,20 @@ static int runSelfTest()
         QCoreApplication::processEvents();
         pet.grab().save(exeDir.filePath(QStringLiteral("petpal_selftest_fall.png")));
 
+        // 桌宠台词气泡：真的冒一句 + 离屏抓一张（WA_DontShowOnScreen，不会
+        // 在用户桌面上闪）。文字截没截、尺寸对不对、描边上没上，看图就知道。
+        {
+            const QPixmap bp = pet.debugGrabBubble(
+                QStringLiteral("你好呀～被点、被拎起来、整点报时，我都会冒一句台词哦。"));
+            bp.save(exeDir.filePath(QStringLiteral("petpal_selftest_bubble.png")));
+        }
+
+        // 桌宠特效：爱心粒子撒满的一帧 + 离屏抓一张（心形形状/颜色/淡出一眼可见）
+        {
+            const QPixmap fp = pet.debugGrabFx();
+            fp.save(exeDir.filePath(QStringLiteral("petpal_selftest_fx.png")));
+        }
+
         // ---------- 顺带记一笔尺寸 / DPI ----------
         // 为什么要记？因为本机上 grab() 出来的图会比窗口的 size() 大 1.5 倍
         //（上面那三张预览图就是 275x378 而不是 183x252）。
@@ -601,6 +618,22 @@ static int runSelfTest()
                 // 只写一句"字号偏好已加载"看不出它到底是在读还是在瞎猜。
                 ts << QStringLiteral("\r\n--- 界面字号（设置页那个滑条 · 首选项）---\r\n");
                 ts << UiFont::describe();
+
+                // 主题外观：和字号同类的首选项（同一个 ini），报告里一并交代
+                // 当前主题、背景图在不在、不透明度 —— "设了图但文件被删了"
+                // 这种情况只有把实际路径印出来才查得明白。
+                ts << QStringLiteral("\r\n--- 主题外观（设置页 · 首选项）---\r\n");
+                ts << UiTheme::describe();
+
+                // 桌宠台词：报告池子规模和挑句样例 —— 跑的是运行时同一条
+                // PetSay::pick 路径，样例里的句子就是桌宠实际会冒的话。
+                ts << QStringLiteral("\r\n--- 桌宠台词（PetSay）---\r\n");
+                ts << PetSay::describe();
+
+                // 联网音乐模块：报告缓存/存储路径和接口清单（自检本身不发网络
+                // 请求，保持离线可跑；接口是否通要实际搜索时看列表行提示）
+                ts << QStringLiteral("\r\n--- 联网音乐（播放器搜索）---\r\n");
+                ts << OnlineMusic::describe();
 
                 ts.flush();
                 f.close();
@@ -946,5 +979,13 @@ int main(int argc, char* argv[])
 
     // exec() 会阻塞在这里跑 Qt 事件循环，直到有人调用 quit()。
     // 程序"活"着的整个过程都发生在这行里面。
-    return app.exec();
+    const int exitCode = app.exec();
+
+    // 退出清理：联网下载的临时目录（C 盘 %TEMP%/PetPalMusic）整目录删除
+    // ——按用户要求，临时缓存放 C 盘、关程序就清。收藏/下载到储存盘的不受影响。
+    // （桌宠/播放器在 main 的作用域里还活着，但 exec 返回后音频设备已随
+    //   事件循环停止；个别文件被占用删不掉的，下次启动的清残留会兜底。）
+    OnlineMusic::clearTempDir();
+
+    return exitCode;
 }

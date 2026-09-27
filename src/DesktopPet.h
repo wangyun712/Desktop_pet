@@ -26,6 +26,7 @@
 #include <QVector>
 
 #include "PetConfig.h"
+#include "PetSay.h"            // 桌宠独白台词池（Picker 以值成员持有，要完整类型）
 
 class QTimer;
 class QMenu;
@@ -40,6 +41,8 @@ class PlayerPage;
 class AffectionPage;
 class SettingsPage;
 class DailyImagePage;
+class PetBubble;               // 头顶台词气泡（独立置顶小窗，指针持有）
+class PetFx;                   // 粒子特效层（爱心/Zzz，独立置顶小窗，指针持有）
 
 class DesktopPet : public QWidget
 {
@@ -68,6 +71,15 @@ public:
     // -----------------------------------------------------------------------
     void debugSetState(PetState s);
 
+    // 【只给 --selftest 用】让气泡真的冒一句话，再把气泡窗离屏抓成图。
+    // 气泡是独立小窗，桌宠自己的 grab() 拍不到它；拍它自己才能一眼看出
+    // "文字有没有被截、尺寸算得对不对、主题色上没上"。
+    QPixmap debugGrabBubble(const QString& text);
+
+    // 【只给 --selftest 用】让特效层撒满爱心粒子，再把特效窗离屏抓成图。
+    // 心形形状/颜色/淡出对不对，看图就知道。
+    QPixmap debugGrabFx();
+
     // 托盘状态描述，给 --selftest 用。
     // 托盘是个"看不见的功能"——出问题时用户只会觉得"点了隐藏就再也叫不回来"，
     // 所以把可用性、图标有没有建起来、菜单项是否启用都写进自检报告，排错第一步就能看到。
@@ -78,6 +90,14 @@ public:
 
     // 好感度数据对象。面板页拿它读数字，--affectiontrace 之外没人会改它。
     AffectionSystem* affection() const { return m_affection; }
+
+    // 「桌宠互动」开关（设置页 → 这里）。改内存 + 落盘（键在 ui.ini），
+    // 关掉时正在显示的气泡也会收起来。
+    void setPetSayEnabled(bool on);
+
+    // 「桌宠大小」滑条（设置页 → 这里）：50%~200%，按脚底锚点整体缩放。
+    // 改内存 + 落盘（ui.ini petScale/percent），立即 resize 生效。
+    void setPetScale(int percent);
 
     // 【只给 --selftest 用】真的跑一遍"隐藏 -> 恢复"往返，把每一步的窗口可见性、
     // 心跳开关、自动行为开关都记下来。
@@ -102,6 +122,10 @@ signals:
     // 在主程序里 connect 这个信号，拿到回答后再决定播 09 开心 / 10 委屈 / 11 惊讶 / 12 生气。
     void chatRequested();
 
+    // 用户把音乐文件拖到了桌宠身上（路径已按扩展名过滤）。
+    // 播放器页接它：入列并从第一首开始播。
+    void musicFilesDropped(const QStringList& paths);
+
 protected:
     // 每次窗口重新变得可见（启动、从状态栏恢复、被系统重新显示）都会走这里。
     // 它只做一件事：把"始终置顶"重新钉一遍（原因见 .cpp 里 ensureOnTop 的说明）。
@@ -111,6 +135,10 @@ protected:
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
     void contextMenuEvent(QContextMenuEvent* event) override;
+    // 外部文件拖入（资源管理器拖歌到桌宠身上）。
+    // 和"鼠标拖自己"互不打扰：拖放期间鼠标事件根本不会发给本窗口。
+    void dragEnterEvent(QDragEnterEvent* event) override;
+    void dropEvent(QDropEvent* event) override;
 
 private slots:
     void onTick();                                       // 60Hz 心跳
@@ -143,6 +171,14 @@ private:
     void runChain(const QVector<PetState>& chain);
     void playNextInChain();
     void onPetClicked();
+
+    // ---------- 桌宠说话 ----------
+    // 全部的门禁都在这一道：开关 / 藏进托盘 / 气泡正忙 / PetSay 内部节流。
+    // 挑不到句子就安静 —— 宁可少说，不能刷屏。arg 填 %1（歌名等）。
+    // force = true：无视"气泡正忙"和节流（连点彩蛋的爆发台词用）。
+    void petSay(PetSay::Event ev, const QString& arg = QString(),
+                qint64 minGapMs = 5000, bool force = false);
+    void petSayHourly();           // 整点报时（%1 = 小时数，深夜自动换劝睡池）
 
     // ---------- 移动 ----------
     void startWalk(int direction, int durationMs);
@@ -184,7 +220,9 @@ private:
     //   · 不用面板的用户，程序启动时不该多花时间搭一堆看不见的控件；
     //   · 藏进状态栏的时候，面板如果早就存在，还得额外记得把它藏起来。
     // 建好之后就一直留着（关闭只是 hide，不销毁），所以再点开是"秒开"、状态不丢。
-    void openPanel();
+    // 打开主面板。showPanel = false 时只**创建**不显示 —— 拖放音乐到桌宠
+    // 身上走这条路：播放器在面板里，建好了才能播，但面板不该弹出来。
+    void openPanel(bool showPanel = true);
     void closePanel();         // 藏进状态栏时要顺手把面板收起来
 
     // ---------- 数据 ----------
@@ -242,4 +280,26 @@ private:
     ChatPage*      m_chatPage  = nullptr;
     PlayerPage*    m_playerPage = nullptr;
     SettingsPage*  m_setPage   = nullptr;
+
+    // ---------- 桌宠说话 ----------
+    PetBubble*     m_bubble        = nullptr;   // 头顶气泡（独立置顶小窗，常驻隐藏）
+    PetSay::Picker m_sayPicker;                 // 节流 + 避重都在它里面
+    bool           m_petSayEnabled = false;     // 设置页开关（ui.ini petSay/enabled）
+    int            m_lastHour      = -1;        // 整点报时用（ctor 里初始化为当前小时）
+    QTimer*        m_chatterTimer  = nullptr;   // 随机闲聊的节拍器（60s 一看，看缘分开口）
+
+    // ---------- 粒子特效 / 连点彩蛋 ----------
+    PetFx*        m_fx        = nullptr;       // 爱心/Zzz 特效层（独立置顶小窗）
+    int           m_pokeCount = 0;             // 连点计数（1.5s 滚动窗口内有效）
+    QElapsedTimer m_pokeClock;                 // 距上次点击的计时
+
+    // ---------- 桌宠大小 ----------
+    // 缩放系数（0.5~2.0，1.0 = 原始像素）。吃它的只有四个函数：
+    // resizeWindowForState（窗口尺寸）/ paintEvent（画大画小）/
+    // frameTopLeft（底边对齐按缩放后尺寸算）/ hitCharacter（采样缩放后的图）——
+    // 地面线、锚点、拖拽、气泡跟随全部经窗口几何自动成立，不用各自适配。
+    double m_petScale = 1.0;
+
+    // 返回"按当前系数缩放后的当前帧"。scale == 1 时原样返回，零开销。
+    QPixmap scaledFrame(const QPixmap& pm) const;
 };

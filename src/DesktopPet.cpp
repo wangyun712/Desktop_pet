@@ -8,7 +8,8 @@
 #include "DailyImagePage.h"
 #include "ChatPage.h"
 #include "PlayerPage.h"
-
+#include "PetBubble.h"
+#include "PetFx.h"
 
 #include <QApplication>
 #include <QGuiApplication>
@@ -16,12 +17,19 @@
 #include <QTimer>
 #include <QPainter>
 #include <QMouseEvent>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+#include <QMimeData>
 #include <QContextMenuEvent>
 #include <QMenu>
 #include <QAction>
 #include <QSystemTrayIcon>
 #include <QIcon>
 #include <QImage>
+#include <QFileInfo>
+#include <QUrl>
+#include <QTime>
+#include <QSettings>
 #include <QVBoxLayout>
 #include <QLabel>
 #include <QRandomGenerator>
@@ -88,6 +96,60 @@ DesktopPet::DesktopPet(QWidget* parent) : QWidget(parent)
     // 菜单项的可用状态先刷一次。平时这一步由 contextMenuEvent 负责，
     // 但"隐藏到状态栏"要靠它根据托盘是否可用来禁用，自检报告也读这个结果。
     refreshMenuState();
+
+    // ---- 桌宠台词气泡 ----
+    // 独立置顶小窗（桌宠本体窗口只有角色那么大，气泡画在里面会被裁掉）。
+    // parent = this：随桌宠一起销毁。平时隐藏，petSay() 才冒出来。
+    m_bubble = new PetBubble(nullptr);   // ★ 刻意不给 parent ★ 带 parent 的 Qt::Tool
+                                         // 透明小窗在 Windows 上显示会出问题
+                                         // （和已验证正常的 DesktopLyrics 对齐：独立顶层窗）
+    m_bubble->trackPet(this);
+    m_petSayEnabled = PetSay::loadEnabled();
+
+    // ---- 粒子特效层（爱心 / 睡觉 Zzz）----
+    // 同样是无 parent 的独立顶层窗 + 手动回收；WA_TransparentForMouseEvents
+    // 让它盖在桌宠头顶也不挡点击（见 PetFx.h）。
+    m_fx = new PetFx(nullptr);
+    m_fx->trackPet(this);
+
+    // 接受外部文件拖入（资源管理器拖歌到桌宠身上）。和"鼠标拖自己"互不打扰：
+    // 拖放走系统的 dragEnter/drop 事件链，拖放期间鼠标事件根本不会发给本窗口。
+    setAcceptDrops(true);
+
+    // ---- 随机闲聊 / 梦话的节拍器 ----
+    // 一分钟看一眼：
+    //   · 睡着了 → 30% 概率冒一句梦话（3 分钟冷却）—— 只冒气泡，不会吵醒它；
+    //   · 醒着   → 15% 概率 + 气泡空闲 + PetSay 内部 90 秒冷却才闲聊。
+    // 概率放在定时器里而不是加长间隔 —— 间隔固定 + 每次都说是"闹钟"，
+    // 带点随机的沉默才是"它自己想说"。
+    m_chatterTimer = new QTimer(this);
+    m_chatterTimer->setInterval(60 * 1000);
+    connect(m_chatterTimer, &QTimer::timeout, this, [this] {
+        if (!m_petSayEnabled || m_hiddenToTray || !m_bubble || m_bubble->isBusy())
+            return;
+
+        if (m_behavior->isSleeping())
+        {
+            if (QRandomGenerator::global()->bounded(100) < 30)
+                petSay(PetSay::Event::Dream, QString(), 180 * 1000);
+            return;
+        }
+
+        if (QRandomGenerator::global()->bounded(100) < 15)
+            petSay(PetSay::Event::Idle, QString(), 90 * 1000);
+    });
+    m_chatterTimer->start();
+
+    // 整点报时的小闹钟从当前小时起算：启动那一刻不报（刚露面就报时会显得神经质）
+    m_lastHour = QTime::currentTime().hour();
+
+    // ---- 桌宠大小（缩放档位）----
+    // 这里只读档位；真正的窗口缩放发生在 start() 的 resizeWindowForState(Idle)。
+    // 吃系数的只有四个函数（见 DesktopPet.h 里 m_petScale 的说明）。
+    m_petScale = qBound(50, QSettings(QSettings::IniFormat, QSettings::UserScope,
+                                      QStringLiteral("PetPal"), QStringLiteral("ui"))
+                             .value(QStringLiteral("petScale/percent"), 100).toInt(),
+                       200) / 100.0;
 }
 
 DesktopPet::~DesktopPet()
@@ -99,8 +161,14 @@ DesktopPet::~DesktopPet()
 
     // 主面板是顶层窗口（没有 parent），QWidget 的父子自动回收管不到它，必须手动收。
     // 好感度不在这里 delete —— 它的 parent 是 this，跟着一起走。
+    // 气泡同样是独立顶层窗（刻意不给 parent：带 parent 的 Qt::Tool 透明小窗
+    // 在 Windows 上显示会出问题，见 PetBubble.h），也在这里手动收。
     delete m_panel;
     m_panel = nullptr;
+    delete m_bubble;
+    m_bubble = nullptr;
+    delete m_fx;
+    m_fx = nullptr;
 }
 
 // =============================================================================
@@ -272,6 +340,20 @@ void DesktopPet::start()
 
     // 6) 交给行为控制器，让它开始随机安排动作
     m_behavior->start();
+
+    // 7) 第一次露面：打个招呼。
+    //    优先级：今天是不是节日 > 是不是陪伴里程碑（满百天/满周年）> 时间段问候。
+    //    延迟 1.2 秒 —— 等桌宠站稳、窗口尺寸和置顶都钉好了再出气泡，
+    //    刚 show() 就冒泡会和首帧渲染挤在一起。
+    QTimer::singleShot(1200, this, [this] {
+        if (!m_petSayEnabled || m_hiddenToTray || !m_bubble || m_bubble->isBusy())
+            return;
+        const QString line = m_sayPicker.greet(
+            QTime::currentTime().hour(),
+            m_affection ? m_affection->companyDays() : 0);
+        if (!line.isEmpty())
+            m_bubble->say(line);
+    });
 }
 
 // =============================================================================
@@ -291,8 +373,8 @@ void DesktopPet::paintEvent(QPaintEvent* event)
     // 这一句不能省。窗口被移动或缩小后，旧像素会留在原地变成"拖影"。
     p.fillRect(rect(), Qt::transparent);
 
-    // 第二步：画当前帧
-    const QPixmap& pm = m_anim->currentPixmap();
+    // 第二步：画当前帧（按「桌宠大小」系数缩放；100% 时原样返回零开销）
+    const QPixmap pm = scaledFrame(m_anim->currentPixmap());
     if (pm.isNull())
     {
         // 资源没加载成功时的兜底提示，避免用户对着一个"什么都不显示"的窗口猜问题
@@ -340,9 +422,15 @@ void DesktopPet::resizeWindowForState(PetState s)
     if (m_inResize)
         return;
 
-    const QSize box = m_anim->frameBoxSize(s);
+    QSize box = m_anim->frameBoxSize(s);
     if (box.isEmpty())
         return;              // 资源缺失，保持原尺寸
+
+    // 「桌宠大小」缩放：窗口按系数放大/缩小（脚底锚点不变，见 anchorScreenPos）
+    if (m_petScale != 1.0)
+        box = QSize(qRound(box.width() * m_petScale),
+                    qRound(box.height() * m_petScale));
+
     if (box == size())
         return;              // 尺寸没变，不折腾
 
@@ -422,6 +510,16 @@ void DesktopPet::onTick()
             goIdle();
         }
     }
+
+    // ---- 整点报时 ----
+    // 心跳 60Hz 里只做一次整数比较；小时变了才挑句。
+    // （PetSay 内部还有 5 秒节流 + 避重；petSayHourly 里再挡开关和气泡正忙。）
+    const int hour = QTime::currentTime().hour();
+    if (hour != m_lastHour)
+    {
+        m_lastHour = hour;
+        petSayHourly();
+    }
 }
 
 // =============================================================================
@@ -442,6 +540,11 @@ void DesktopPet::applyWindowPos()
     const QPoint topLeft(qRound(m_pos.x()), qRound(m_pos.y()));
     if (topLeft != pos())
         move(topLeft);
+
+    // 头顶气泡跟着走。petMoved 内部有"桌宠没动就不动"的短路，
+    // 走路 60Hz 调它也不贵；拖动跟随走的也是这里（clampToScreen 会调到）。
+    if (m_bubble && m_bubble->isVisible())
+        m_bubble->petMoved();
 }
 
 // =============================================================================
@@ -738,6 +841,9 @@ void DesktopPet::landFromFall()
     m_move = Move::None;
     clampToScreen(/*allowTurn=*/false);
     m_anim->setState(PetState::Idle, true);
+
+    // 落地：冒一句落地台词（拎起 → 下落 → 落地 是一套完整的小剧情）
+    petSay(PetSay::Event::Landed);
 }
 
 // =============================================================================
@@ -843,6 +949,29 @@ void DesktopPet::onPetClicked()
     // 不然点到第 11 下它就突然变成一块木头了。
     m_affection->addFromPet();
 
+    // ---- 连点彩蛋：1.5 秒内连戳 10 下，它真的会生气 ----
+    // 计数走"滚动窗口"：距上一次点击超过 1.5s 就从头数。攒满 10 下：
+    // 跺脚 + 生气链 + 专属台词（强制出句 —— 彩蛋就该抢眼），计数清零。
+    if (m_pokeClock.isValid() && m_pokeClock.elapsed() <= 1500)
+        ++m_pokeCount;
+    else
+        m_pokeCount = 1;
+    m_pokeClock.restart();
+
+    if (m_pokeCount >= 10)
+    {
+        m_pokeCount = 0;
+        runChain(QVector<PetState>{ PetState::Angry, PetState::AngryFoot });
+        petSay(PetSay::Event::Angry, QString(), 0, /*force=*/true);
+        return;                        // 生气这一次就不播普通点击反应了
+    }
+
+    // 被点了：冒一句互动台词（PetSay 内部 5 秒节流 —— 连着点不会刷屏）
+    // + 两颗小心心从头顶飘起
+    petSay(PetSay::Event::Clicked);
+    if (m_fx)
+        m_fx->burstHearts(2);
+
     if (wasSleeping)
     {
         // 睡觉时被点：SLEEP -> WAVE -> HAPPY -> IDLE
@@ -866,6 +995,127 @@ void DesktopPet::onPetClicked()
 }
 
 // =============================================================================
+//  桌宠说话：挑一句台词，从头顶的气泡冒出来
+//
+//  全部的门禁都在这一道：
+//    · 开关关了 / 藏进托盘了 → 不说；
+//    · 气泡还在显示 → 不打断（isBusy）；
+//    · PetSay::Picker 内部还有一层节流 + 避重（主动 5 秒 / 被动 90 秒）。
+//  挑不到句子（冷却中）就安静 —— 宁可少说，不能刷屏。
+// =============================================================================
+void DesktopPet::petSay(PetSay::Event ev, const QString& arg, qint64 minGapMs, bool force)
+{
+    if (!m_petSayEnabled || m_hiddenToTray || !m_bubble)
+        return;
+    if (!force && m_bubble->isBusy())
+        return;                            // 气泡还在说话：不打断（force 才有资格插队）
+
+    const QString line = m_sayPicker.pick(ev, arg, minGapMs);
+    if (!line.isEmpty())
+        m_bubble->say(line);
+}
+
+void DesktopPet::petSayHourly()
+{
+    if (!m_petSayEnabled || m_hiddenToTray || !m_bubble || m_bubble->isBusy())
+        return;
+
+    const QString line = m_sayPicker.hourly(QTime::currentTime().hour(), 5000);
+    if (!line.isEmpty())
+        m_bubble->say(line);
+}
+
+// =============================================================================
+//  「桌宠互动」开关（设置页 → 这里）
+// =============================================================================
+void DesktopPet::setPetSayEnabled(bool on)
+{
+    m_petSayEnabled = on;
+    PetSay::saveEnabled(on);
+    if (!on && m_bubble)
+        m_bubble->hide();                  // 关掉时正在说的话也一并收掉
+}
+
+// =============================================================================
+//  【只给 --selftest 用】让气泡真的冒一句话，再把气泡窗离屏抓成图。
+//  WA_DontShowOnScreen：自检不该在用户桌面上闪一个气泡出来，
+//  但 grab() 照样能把它完整画出来 —— 排查"气泡显示不对"第一步就是看这张图。
+// =============================================================================
+QPixmap DesktopPet::debugGrabBubble(const QString& text)
+{
+    if (!m_bubble)
+        return QPixmap();
+
+    m_bubble->setAttribute(Qt::WA_DontShowOnScreen, true);
+    m_bubble->say(text);
+    for (int i = 0; i < 8; ++i)
+        QApplication::processEvents();     // 让 relayout / show / 首帧都走完
+
+    const QPixmap pm = m_bubble->grab();
+    qInfo() << "[selftest] bubble geom:" << m_bubble->geometry()
+            << "visible:" << m_bubble->isVisible();
+    m_bubble->hide();
+    m_bubble->setAttribute(Qt::WA_DontShowOnScreen, false);
+    return pm;
+}
+
+// =============================================================================
+//  「桌宠大小」滑条（设置页 → 这里）
+//
+//  缩放只动两样：窗口尺寸（按脚底锚点）和画出来的图。命中检测、地面线、
+//  气泡跟随全部经窗口几何自动成立。改完落盘，下次启动就是这个大小。
+// =============================================================================
+void DesktopPet::setPetScale(int percent)
+{
+    const int pct = qBound(50, percent, 200);
+    const double s = pct / 100.0;
+    if (s == m_petScale)
+        return;
+
+    m_petScale = s;
+    QSettings(QSettings::IniFormat, QSettings::UserScope,
+              QStringLiteral("PetPal"), QStringLiteral("ui"))
+        .setValue(QStringLiteral("petScale/percent"), pct);
+
+    // 按脚底锚点立刻缩放窗口（resizeWindowForState 内部吃 m_petScale）
+    resizeWindowForState(m_anim->state());
+    update();
+}
+
+// =============================================================================
+//  当前帧按「桌宠大小」系数缩放后的版本。scale == 1 时原样返回，零开销。
+//  每帧现算一次平滑缩放（帧定时器 100ms 一拍）—— 183x252 的图在这个量级
+//  上毫秒级完成，不值得再养一份缩放缓存。
+// =============================================================================
+QPixmap DesktopPet::scaledFrame(const QPixmap& pm) const
+{
+    if (m_petScale == 1.0 || pm.isNull())
+        return pm;
+    return pm.scaled(qRound(pm.width() * m_petScale),
+                     qRound(pm.height() * m_petScale),
+                     Qt::KeepAspectRatio, Qt::SmoothTransformation);
+}
+
+// =============================================================================
+//  【只给 --selftest 用】让特效层撒满爱心，再把特效窗离屏抓成图。
+//  心形形状/颜色/淡出对不对，看图就知道（和气泡那张同一个思路）。
+// =============================================================================
+QPixmap DesktopPet::debugGrabFx()
+{
+    if (!m_fx)
+        return QPixmap();
+
+    m_fx->setAttribute(Qt::WA_DontShowOnScreen, true);
+    m_fx->burstHearts(14);
+    for (int i = 0; i < 10; ++i)
+        QApplication::processEvents();     // 让粒子推进一两拍，抓"飞在半空"的样子
+
+    const QPixmap pm = m_fx->grab();
+    m_fx->setAttribute(Qt::WA_DontShowOnScreen, false);
+    return pm;
+}
+
+// =============================================================================
 //  动画换帧 -> 请求重绘
 // =============================================================================
 void DesktopPet::onFrameChanged()
@@ -883,6 +1133,17 @@ void DesktopPet::onAnimationStateChanged(PetState now, PetState before)
     Q_UNUSED(before);
     resizeWindowForState(now);
     update();
+
+    // ★ 换状态 = 窗口尺寸变了（拎起图比站立图高 12px，底边贴地、顶边向上长）
+    //   顶边一抬就会盖进气泡 —— 必须在这里同步把气泡挪到新头顶上，
+    //   30ms 的跟随轮询盖不住 resize 后的头两帧，那就是"气泡闪一下缺一块"。
+    if (m_bubble && m_bubble->isVisible())
+        m_bubble->petMoved();
+
+    // 睡觉 Zzz：进入 Sleep 飘起来，离开（被叫醒/换状态）自动停。
+    // 自动睡和菜单手动睡都走 applyState 这条路，一个钩子全覆盖。
+    if (m_fx)
+        m_fx->setSleeping(now == PetState::Sleep);
 }
 
 // =============================================================================
@@ -939,6 +1200,10 @@ void DesktopPet::onBehaviorState(PetState s, int holdMs)
     //                 再也掉不下去（站着悬在空中，看着就像卡死了）。
     if (m_dragging || isFalling())
         return;
+
+    // 睡着了：冒一句犯困的台词（自动睡和菜单里手动睡都走这条 requestState 路）
+    if (s == PetState::Sleep)
+        petSay(PetSay::Event::Sleepy);
 
     applyState(s, holdMs);
 }
@@ -1021,6 +1286,9 @@ void DesktopPet::mouseMoveEvent(QMouseEvent* event)
         m_pressTopLeft = pos();
 
         m_behavior->notifyUserInteraction();
+
+        // 被拎起来了：冒一句抗议/惊呼（只在拖动开始的这一下说，不是每次 move）
+        petSay(PetSay::Event::Lifted);
     }
 
     // 桌宠跟随鼠标：窗口左上角 = 按下时的左上角 + 鼠标位移
@@ -1072,6 +1340,67 @@ void DesktopPet::mouseReleaseEvent(QMouseEvent* event)
 }
 
 // =============================================================================
+//  外部文件拖入：音乐文件直接入列播放
+//
+//  ★ 和"鼠标拖自己"互不打扰 ★ 外部拖放走系统的 dragEnter/drop 事件链，
+//  拖放期间鼠标事件根本不会发给本窗口；桌宠自己的"拎起来"走
+//  mousePress/Move/Release —— 两条路互不相干。
+//
+//  只认 mp3 / flac / wav（和 MusicLibrary::audioSuffixes 一个口径的最小集）：
+//  拖个 txt 过来不该有任何反应。
+// =============================================================================
+void DesktopPet::dragEnterEvent(QDragEnterEvent* event)
+{
+    const QList<QUrl> urls = event->mimeData()->urls();
+    bool hasSong = false;
+    for (const QUrl& url : urls)
+    {
+        const QString suffix = QFileInfo(url.toLocalFile()).suffix().toLower();
+        if (suffix == QLatin1String("mp3") || suffix == QLatin1String("flac")
+            || suffix == QLatin1String("wav"))
+        {
+            hasSong = true;
+            break;
+        }
+    }
+
+    if (!hasSong)
+        return;                            // 不是音频：不接，拖放自然落到别的窗口
+
+    event->acceptProposedAction();
+
+    // 引导气泡：dragEnter 在拖动悬停期间会反复触发，
+    // PetSay 的 5 秒节流 + 气泡正忙检查正好把它压成"只说一次"。
+    petSay(PetSay::Event::DropHint);
+}
+
+void DesktopPet::dropEvent(QDropEvent* event)
+{
+    QStringList paths;
+    const QList<QUrl> urls = event->mimeData()->urls();
+    for (const QUrl& url : urls)
+    {
+        const QString path = url.toLocalFile();
+        const QString suffix = QFileInfo(path).suffix().toLower();
+        if (suffix == QLatin1String("mp3") || suffix == QLatin1String("flac")
+            || suffix == QLatin1String("wav"))
+            paths.append(path);
+    }
+
+    if (paths.isEmpty())
+        return;
+
+    event->acceptProposedAction();
+
+    // 面板没建过就**静默**建好（不弹出）：播放器在面板里，建好了才能播。
+    // openPanel(false) = 只创建 + 接线，不 showCenteredIn —— 歌照响，面板不弹。
+    openPanel(/*showPanel=*/false);
+
+    petSay(PetSay::Event::Dropped);
+    emit musicFilesDropped(paths);
+}
+
+// =============================================================================
 //  右键菜单
 // =============================================================================
 void DesktopPet::contextMenuEvent(QContextMenuEvent* event)
@@ -1104,7 +1433,9 @@ bool DesktopPet::hitCharacter(const QPoint& localPos) const
     if (!PetCfg::HIT_TEST_ALPHA)
         return true;   // 关掉像素级判定：整个窗口矩形都能点
 
-    const QPixmap& pm = m_anim->currentPixmap();
+    // 采样"缩放后实际画出来的那张图" —— 窗口多大、图就多大，
+    // 坐标天然一致，缩放档位下像素级命中依然准确。
+    const QPixmap pm = scaledFrame(m_anim->currentPixmap());
     if (pm.isNull())
         return true;   // 没有图（资源缺失）时宽松处理，否则用户什么都点不动
 
@@ -1484,7 +1815,7 @@ QString DesktopPet::debugTrayRoundTrip()
 //    再加页不需要占位函数，MainPanel 的 addPage 本身就是那个接口。）
 // =============================================================================
 
-void DesktopPet::openPanel()
+void DesktopPet::openPanel(bool showPanel)
 {
     if (!m_panel)
     {
@@ -1502,12 +1833,20 @@ void DesktopPet::openPanel()
         connect(m_affPage, &AffectionPage::petPetted, this, [this]() {
             // 返回 0 说明额度用完或还在冷却 —— 那就什么也不做（面板按钮此时本来就是灰的）
             if (m_affection->addFromPet() > 0.0)
+            {
                 runChain(QVector<PetState>{ PetState::Happy });          // 摸摸 -> 开心
+                petSay(PetSay::Event::Petted);                           // + 头顶冒一句
+                if (m_fx) m_fx->burstHearts(5);                          // + 五颗小心心
+            }
         });
 
         connect(m_affPage, &AffectionPage::feedRequested, this, [this]() {
             if (m_affection->addFromFeed() > 0.0)
+            {
                 runChain(QVector<PetState>{ PetState::Eat, PetState::Happy });  // 喂食 -> 吃东西
+                petSay(PetSay::Event::Fed);                                     // + 头顶冒一句
+                if (m_fx) m_fx->burstHearts(7);                                 // + 七颗小心心
+            }
         });
 
         connect(m_affPage, &AffectionPage::chatRequested, this, &DesktopPet::noteChat);
@@ -1573,15 +1912,73 @@ void DesktopPet::openPanel()
         //   要等重启才会变成新字号 —— 这种"有的页变了有的页没变"的 bug
         //   很容易被当成偶发，排查起来很亏。统一刷一遍，代价只是拼六段字符串。
         //   还要刷 m_panel 自己：左侧导航和右上那几个窗控按钮是外壳的，不归页面管。
-        connect(m_setPage, &SettingsPage::uiScaleChanged, this, [this]() {
+        // ★ 换主题色走的是同一条路 ★（uiScaleChanged / themeChanged 两个信号
+        //   接同一个 lambda）—— 页面样式表里的色值要重换成新主题的，和字号
+        //   改写是同一道工序（都在 UiFont::styleSheet() 网关里）。
+        const auto reapplyAllPageStyles = [this]() {
             if (m_panel)      m_panel->applyUiScale();
             if (m_affPage)    m_affPage->applyUiScale();
             if (m_dailyPage)  m_dailyPage->applyUiScale();
             if (m_chatPage)   m_chatPage->applyUiScale();
             if (m_playerPage) m_playerPage->applyUiScale();
             if (m_setPage)    m_setPage->applyUiScale();
+        };
+        connect(m_setPage, &SettingsPage::uiScaleChanged, this, reapplyAllPageStyles);
+        connect(m_setPage, &SettingsPage::themeChanged,   this, reapplyAllPageStyles);
+
+        // ---- 背景图 / 不透明度变了 -> 面板重画 + 播放器兜底封面跟进 ----
+        // 底色和背景图是 MainPanel::paintEvent 自绘的，跟各页的样式表无关 ——
+        // 拖不透明度滑条时一个 tick 发一次，这里只 update() 重画一层图，
+        // 千万别挂到上面那个"六页重套"的 lambda 上，不然滑条会卡。
+        // 背景图本身换没换，paintEvent 里靠"路径 != 上次加载的路径"自己发现。
+        // 播放器那边同理：只有"正垫着主题图当封面"的歌才需要跟进
+        // （refreshFallbackCover 自己会挡掉"没垫图"和"图没换"两种情况）。
+        connect(m_setPage, &SettingsPage::panelBackgroundChanged, this, [this]() {
+            if (m_panel)      m_panel->update();
+            if (m_playerPage) m_playerPage->refreshFallbackCover();
         });
+
+        // ---- 桌面歌词开关 -> 播放器页显隐悬浮窗 ----
+        // 数据（歌词、进度）都在播放器页，所以开关只负责"喊一声"，
+        // 显隐和喂词都是它自己的事。
+        connect(m_setPage, &SettingsPage::desktopLyricsToggled,
+                m_playerPage, &PlayerPage::setDesktopLyricsEnabled);
+
+        // ---- 桌面歌词三连击 -> 唤出主面板 ----
+        // 走 openPanel()：居中 + 抬到前台 + 重钉桌宠置顶，和托盘/右键菜单
+        // 打开面板是同一条路，行为完全一致。
+        connect(m_playerPage, &PlayerPage::desktopLyricsPanelRequested,
+                this, [this]() { openPanel(); });
+
+        // ---- 桌宠台词：切歌报歌名 ----
+        // 播放器换歌（手动点/自动切/拖入）都会走 loadLyricsAndCover，
+        // currentTrackChanged 只在这条路上发一次 —— 报的永远是"正在播的这首"。
+        connect(m_playerPage, &PlayerPage::currentTrackChanged, this,
+                [this](const QString& title) {
+                    petSay(PetSay::Event::SongChanged, title);
+                });
+
+        // ---- 拖到桌宠身上的音乐文件 -> 播放器入列播放 ----
+        connect(this, &DesktopPet::musicFilesDropped,
+                m_playerPage, &PlayerPage::playDroppedFiles);
+
+        // ---- 「桌宠互动」开关 -> 桌宠显隐气泡 ----
+        connect(m_setPage, &SettingsPage::petSayToggled,
+                this, &DesktopPet::setPetSayEnabled);
+
+        // ---- 悬浮窗 × 关闭 -> 设置页勾选框反向同步 ----
+        connect(m_playerPage, &PlayerPage::desktopLyricsEnabledChanged,
+                m_setPage, &SettingsPage::refreshDesktopLyricsToggle);
+
+        // ---- 「桌宠大小」滑条 -> 桌宠缩放 ----
+        connect(m_setPage, &SettingsPage::petScaleChanged,
+                this, &DesktopPet::setPetScale);
     }
+
+    // 拖放路径（showPanel = false）到这里就完了：面板和播放器都建好、
+    // 信号都接好，音乐照播，但面板不弹出来。
+    if (!showPanel)
+        return;
 
     // 居中在"桌宠所在的那块屏幕"，不是主屏。
     // 双屏时这一点很关键：桌宠在副屏上待着，面板却弹到主屏正中，会像是别的程序弹出来的。

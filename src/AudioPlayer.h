@@ -21,8 +21,10 @@
 //    而且彻底避开了"音频线程里碰 QWidget"这类经典崩溃。
 // =============================================================================
 
+#include <QMap>
 #include <QObject>
 #include <QString>
+#include <QUrl>
 
 class QTimer;
 
@@ -36,6 +38,12 @@ public:
     // 换一首歌。成功返回 true；失败时把原因写进 errorOut（界面拿去显示）。
     // ★ 换歌会自动把上一首停掉并释放 ★ —— 不用调用方记得先 stop()。
     bool load(const QString& path, QString* errorOut = nullptr);
+
+    // 在线流式播放：从 HTTP 直链**边下边播**，不落盘（网易云 MP3 用）。
+    // durationMs 用搜索结果带的时长（流式拿不到总长）；headers 放 Referer 等。
+    // 失败原因写 errorOut。换歌同样自动停掉上一首。
+    bool loadOnline(const QUrl& url, qint64 durationMs,
+                    const QMap<QString, QString>& headers, QString* errorOut = nullptr);
 
     bool hasTrack() const;
 
@@ -66,6 +74,7 @@ signals:
 
 private:
     void onTick();
+    void restartStreamAt(qint64 byteOffset);   // 流式播放：seek 出缓冲区 → Range 续传
 
     // ★ pimpl：miniaudio.h 那 4MB 只允许出现在 .cpp 里 ★
     //   头文件里连 ma_engine 这个名字都不出现，所以谁 include 了 AudioPlayer.h

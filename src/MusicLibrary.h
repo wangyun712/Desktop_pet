@@ -89,6 +89,8 @@ public:
     const QVector<Track>& tracks() const { return m_tracks; }
     int  count() const { return m_tracks.size(); }
     const Track* trackAt(int index) const;
+    int  indexOfPath(const QString& path) const;   // 按路径找曲库下标（没有给 -1）
+    void removeAt(int index);                      // 移除一首（"我的下载"里删歌用）
 
     // 返回的是**曲库下标**（不是列表行号）。空查询 = 全部（按扫描顺序）。
     QVector<int> search(const QString& query, int limit = 3000) const;
@@ -112,7 +114,8 @@ public:
     //   "只改数据、不发耗时操作"，永远不阻塞界面。
     //   之所以是 public 而不是 private + friend：lambda 闭包不继承 friend 权限，
     //   各家编译器表现不一致，走 public 最省心（函数名已经写明用途了）。
-    void appendBatch(const QVector<Track>& batch);
+    void appendBatch(const QVector<Track>& batch, bool announce = true);
+    void updateTrackPath(int index, const QString& newPath);   // 流式行下载完成后就地转正
     void finishScan(int total, int skipped);
 
 private:

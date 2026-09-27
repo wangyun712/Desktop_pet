@@ -81,8 +81,11 @@ QString describe();
 // 给自绘代码和手拼的样式表用；整段 QSS 走下面的 styleSheet()。
 int px(int basePx);
 
-// 把一段 QSS 里所有的 `font-size: <数字>px` 按档位改写。
+// 把一段 QSS 按当前外观改写一遍后返回 —— 这是**所有页面 QSS 的总闸**：
+//   ① 主题换色（委托 UiTheme::styleSheet()，默认主题字面量 → 当前主题色）；
+//   ② 把所有的 `font-size: <数字>px` 按字号档位改写。
 // 只认 px —— 项目里字号一律写 px，写 pt 的没有，所以不处理。
+// 页面只需要"套样式表时都走这一道"，两件事就都会发生；新页面自动带主题。
 QString styleSheet(const QString& qss);
 
 // 把 QApplication 的默认字体设为"基准字体 × 档位"。启动时和档位变化时都要调。

@@ -1,8 +1,18 @@
 #include "AudioPlayer.h"
 
+#include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFileInfo>
 #include <QStringList>
 #include <QTimer>
+
+#include <QMutex>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QUrl>
+#include <QWaitCondition>
 
 #include <atomic>
 #include <cstring>
@@ -81,6 +91,18 @@ constexpr int TICK_MS = 200;      // 界面轮询周期：进度条和歌词高�
 constexpr ma_format kFormat     = ma_format_f32;
 constexpr ma_uint32 kChannels   = 2;
 constexpr ma_uint32 kSampleRate = 48000;
+
+// 在线流式播放（StreamFeed）用的 HTTP 客户端。QNetworkAccessManager 全程
+// 在主线程跑，音频线程只通过 StreamFeed 的锁缓冲拿数据。
+QNetworkAccessManager& nam()
+{
+    static QNetworkAccessManager m;
+    return m;
+}
+
+const char* const kStreamUA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 struct BackendChoice
 {
@@ -243,6 +265,9 @@ void onDeviceData(ma_device* pDevice, void* pOutput, const void* /*pInput*/, ma_
 
 } // namespace
 
+// 流式喂数据器（定义在 Impl 之后）：在线播放时给解码器当"数据源"
+struct StreamFeed;
+
 // =============================================================================
 //  Impl
 // =============================================================================
@@ -254,6 +279,8 @@ struct AudioPlayer::Impl
     ma_context* context = nullptr;
     ma_device*  device  = nullptr;
 
+    StreamFeed* stream  = nullptr;    // 在线播放时的流式喂数据器（本地播放为空）
+
     QString backendName;
     QString deviceName;
 
@@ -264,6 +291,250 @@ struct AudioPlayer::Impl
     bool contextReady = false;
     bool deviceReady  = false;
 };
+
+// =============================================================================
+//  StreamFeed —— 在线播放的流式喂数据器
+//
+//  ★ 给谁用 ★ ma_decoder 的自定义 read/seek 回调（ma_decoder_init 的回调版）。
+//    解码器住在音频线程里，read/seek 就发生在音频线程；下载在主线程
+//   （QNetworkAccessManager 的 readyRead 增量追加）。
+//
+//  ★ 线程模型 ★
+//    · m_buf 是"文件字节区间 [m_base, m_base+size)" 的顺序缓冲，只在主线程追加；
+//    · 解码线程 read/seek 时拿 QMutex 短暂加锁 —— 音频回调里加锁是本项目
+//      的破例：等补货时音频线程会停，表现是"缓冲期的一小段静音"。概率靠
+//      预缓冲压到最低：网易云的下载速度通常是播放速度的几十倍；
+//    · seek 到未缓冲区 → 清缓冲 + 发 queued 回主线程用 Range 续传
+//     （m_restart 由 AudioPlayer 设置，内部 invokeMethod 排回主线程）。
+//
+//  ★ 刻意不是 QObject ★ 没有信号槽需求；重启回调用 std::function +
+//  invokeMethod(ctx) 排线程，省一个 moc 注册。
+// =============================================================================
+class StreamFeed
+{
+public:
+    StreamFeed(const QUrl& url, QMap<QString, QString> headers)
+        : m_url(url), m_headers(std::move(headers))
+    {
+    }
+
+    ~StreamFeed()
+    {
+        stop();
+        if (m_reply)
+            m_reply->deleteLater();
+    }
+
+    void setRestartHandler(std::function<void(qint64)> h) { m_restart = std::move(h); }
+
+    void start() { issueGet(0); }
+    void restartAt(qint64 offset) { issueGet(offset); }   // 主线程：Range 续传
+
+    void stop()
+    {
+        {
+            QMutexLocker l(&m_mtx);
+            m_stopped = true;
+        }
+        m_cv.wakeAll();
+        if (m_reply)
+            m_reply->abort();              // 触发 finished → 主线程清理
+    }
+
+    // ---- 解码器回调（音频线程）----
+    size_t read(void* dst, size_t len)
+    {
+        QMutexLocker l(&m_mtx);
+        if (m_read < m_base)
+            m_read = m_base;               // 异常兜底
+
+    qint64 waitedMs = 0;
+    for (;;)
+    {
+        const qint64 inBuf = m_base + qint64(m_buf.size()) - m_read;
+        const bool   atEnd = (m_total >= 0 && m_read >= m_total);
+        if (atEnd || inBuf >= qint64(len))
+            break;                                 // 够了 / 到头了
+        if (m_stopped || (m_finished && inBuf <= 0))
+            break;                                 // 没有更多数据了
+        if (m_finished && inBuf > 0)
+            break;                                 // 下载完：给剩余的短读
+            if (m_failed)
+                break;                                 // 网络出错：交给调用方提示
+            if (waitedMs >= 10000)
+                break;                                 // 弱网兜底：10 秒等不到给短读
+            m_cv.wait(&m_mtx, 50);
+            waitedMs += 50;
+    }
+
+        const qint64 inBuf  = m_base + qint64(m_buf.size()) - m_read;
+        const qint64 remain = (m_total >= 0) ? (m_total - m_read) : qint64(len);
+        const qint64 n = qMin<qint64>(qMin<qint64>(qint64(len), inBuf),
+                                      qMax<qint64>(remain, 0));
+        if (n <= 0)
+            return 0;                      // EOF：解码器走 reachedEnd → trackFinished
+
+        std::memcpy(dst, m_buf.constData() + (m_read - m_base), size_t(n));
+        m_read += n;
+        return size_t(n);
+    }
+
+    bool seek(qint64 off, int origin)
+    {
+        QMutexLocker l(&m_mtx);
+        qint64 target = off;
+        if (origin == ma_seek_origin_current)
+            target += m_read;
+        else if (origin == ma_seek_origin_end)
+            target = (m_total >= 0 ? m_total : m_base + qint64(m_buf.size())) + off;
+        if (target < 0)
+            target = 0;
+
+        if (target >= m_base && target <= m_base + qint64(m_buf.size()))
+        {
+            m_read = target;               // 缓冲内：直接跳
+        }
+        else
+        {
+            // 跳到未缓冲区：清缓冲、从目标重新拉流（主线程 Range 续传）
+            m_base     = target;
+            m_buf.clear();
+            m_read     = target;
+            m_finished = false;
+            m_failed   = false;
+            if (m_restart)
+                m_restart(target);         // handler 内部排回主线程（见上）
+        }
+        m_cv.wakeAll();
+        return true;
+    }
+
+private:
+    void issueGet(qint64 fromOffset)
+    {
+    if (m_reply)
+    {
+        m_reply->disconnect();             // 断开本 reply 的所有信号连接
+        m_reply->abort();
+        m_reply->deleteLater();
+        m_reply = nullptr;
+    }
+
+        {
+            QMutexLocker l(&m_mtx);
+            m_finished = false;
+            m_failed   = false;
+        }
+
+        QUrl url = m_url;
+        QMap<QString, QString> headers = m_headers;
+        if (fromOffset > 0)
+            headers.insert(QStringLiteral("Range"),
+                           QStringLiteral("bytes=%1-").arg(fromOffset));
+
+        QNetworkRequest req(url);
+        // ★ 流式回放不能设总时长上限 ★ 这条连接要活完整首歌 —— 15 秒的话
+        // 每首歌播到一分钟出头就会被 abort。卡死检测交给读侧的 10 秒等待
+        // 兜底：真断了 read 会给短读 → 解码器 EOF → 自然切下一首。
+        req.setTransferTimeout(0);
+        req.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                         QNetworkRequest::NoLessSafeRedirectPolicy);
+        req.setRawHeader("User-Agent", kStreamUA);
+        for (auto it = headers.constBegin(); it != headers.constEnd(); ++it)
+            req.setRawHeader(it.key().toUtf8(), it.value().toUtf8());
+
+        m_reply = nam().get(req);
+        QObject::connect(m_reply, &QNetworkReply::readyRead, m_reply, [this] {
+            const QVariant cl = m_reply->header(QNetworkRequest::ContentLengthHeader);
+            QMutexLocker l(&m_mtx);
+            if (m_total < 0 && cl.isValid())
+                m_total = m_base + cl.toLongLong();
+            m_buf += m_reply->readAll();
+            m_cv.wakeAll();
+        });
+        QObject::connect(m_reply, &QNetworkReply::finished, m_reply, [this] {
+            const QVariant cl = m_reply->header(QNetworkRequest::ContentLengthHeader);
+            QMutexLocker l(&m_mtx);
+            if (m_total < 0 && cl.isValid())
+                m_total = m_base + cl.toLongLong();
+            m_finished = true;
+            m_cv.wakeAll();
+        });
+        QObject::connect(m_reply, &QNetworkReply::errorOccurred, m_reply, [this] {
+            QMutexLocker l(&m_mtx);
+            if (!m_stopped)                    // 主动 abort 的不记错误
+                m_errorText = m_reply->errorString();
+            m_failed = true;               // abort() 也会到这 —— 靠 stopped 区分主动/异常
+            m_cv.wakeAll();
+        });
+    }
+
+    QUrl                   m_url;
+    QMap<QString, QString> m_headers;
+    QNetworkReply*         m_reply = nullptr;
+
+    QMutex         m_mtx;
+    QWaitCondition m_cv;
+    QByteArray     m_buf;          // 文件字节区间 [m_base, m_base+size) 的数据
+    qint64         m_base    = 0;  // m_buf[0] 对应的文件偏移（seek 重拉后 >0）
+    qint64         m_read    = 0;  // 解码器读位置（文件字节偏移）
+    qint64         m_total   = -1; // Content-Length（-1 = 未知）
+    QString        m_errorText;    // 最近一次网络错误（诊断用）
+    bool           m_finished = false;
+    bool           m_failed   = false;
+    bool           m_stopped  = false;
+
+    std::function<void(qint64)> m_restart; // seek 出缓冲区 → 主线程 Range 续传
+
+public:
+    // ---- 诊断 / 预缓冲（主线程）----
+    // ★ 这三个诊断方法刻意不写 const ★ —— 要拿锁，而 m_mtx 不是 mutable。
+    qint64 bufferedBytes()
+    {
+        QMutexLocker l(&m_mtx);
+        return m_base + qint64(m_buf.size()) - m_read;
+    }
+    bool isFailed()
+    {
+        QMutexLocker l(&m_mtx);
+        return m_failed;
+    }
+    QString errorText()
+    {
+        QMutexLocker l(&m_mtx);
+        return m_errorText;
+    }
+
+    // ★ 主线程等首块数据 ★ ma_decoder_init 的探测读发生在主线程，而数据
+    // 靠主线程的事件循环送达 —— 不先缓冲的话，探测读会自锁到超时
+    // （本地事件收不到）。processEvents 转起来，网络事件就能进来。
+    void waitForFirstBytes(int timeoutMs)
+    {
+        QElapsedTimer t;
+        t.start();
+        while (m_buf.isEmpty() && !m_failed && !m_finished && !m_stopped
+               && t.elapsed() < timeoutMs)
+        {
+            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 50);
+        }
+    }
+};
+
+// ---- miniaudio 解码回调：把 StreamFeed 适配成 ma_decoder 的数据源 ----
+ma_result onStreamRead(ma_decoder* pDecoder, void* pBufferOut, size_t bytesToRead,
+                       size_t* pBytesRead)
+{
+    auto* feed = static_cast<StreamFeed*>(pDecoder->pUserData);
+    *pBytesRead = feed ? feed->read(pBufferOut, bytesToRead) : 0;
+    return MA_SUCCESS;                     // 读多少算多少；0 = EOF（解码器自行判定）
+}
+
+ma_result onStreamSeek(ma_decoder* pDecoder, ma_int64 byteOffset, ma_seek_origin origin)
+{
+    auto* feed = static_cast<StreamFeed*>(pDecoder->pUserData);
+    return feed ? (feed->seek(byteOffset, int(origin)) ? MA_SUCCESS : MA_ERROR)
+                : MA_ERROR;
+}
 
 // =============================================================================
 //  构造 / 析构
@@ -404,6 +675,8 @@ AudioPlayer::~AudioPlayer()
         ma_decoder_uninit(&m_impl->shared.decoder);
         m_impl->shared.decoderReady.store(false);
     }
+    delete m_impl->stream;                 // 在线流的喂数据器一并回收
+    m_impl->stream = nullptr;
     if (m_impl->contextReady)
     {
         ma_context_uninit(m_impl->context);
@@ -449,6 +722,8 @@ bool AudioPlayer::load(const QString& path, QString* errorOut)
         ma_decoder_uninit(&m_impl->shared.decoder);
         m_impl->shared.decoderReady.store(false);
     }
+    delete m_impl->stream;                 // 换歌：在线流的喂数据器一并回收
+    m_impl->stream = nullptr;
 
     m_durationMs       = 0;
     m_finishedReported = false;
@@ -485,6 +760,96 @@ bool AudioPlayer::load(const QString& path, QString* errorOut)
     emit positionChanged(0);
     emit stateChanged();
     return true;
+}
+
+// =============================================================================
+//  在线流式播放（网易云 MP3 直链）：边下边播，不落盘
+//
+//  解码器从"文件"换成 StreamFeed 自定义数据源（ma_decoder_init 的回调版，
+//  dr_mp3 默认启用，无需任何后端选择代码）。
+//  时长直接用搜索结果带的毫秒数 —— 流式下 ma_decoder 拿不到总长，不能靠它。
+//  play/pause/seek/进度轮询/reachedEnd/trackFinished 全部复用现有机制：
+//    · seek → ma_decoder_seek_to_pcm_frame → StreamFeed::seek（缓冲内直接跳，
+//      跳出缓冲区由主线程 Range 续传）；
+//    · 播放位置追平下载进度 → StreamFeed::read 短暂等待补货（弱网 = 一小段
+//      静音，不是错误）。
+// =============================================================================
+bool AudioPlayer::loadOnline(const QUrl& url, qint64 durationMs,
+                             const QMap<QString, QString>& headers, QString* errorOut)
+{
+    const auto fail = [this, errorOut](const QString& msg) -> bool {
+        if (errorOut)
+            *errorOut = msg;
+        emit errorOccurred(msg);
+        return false;
+    };
+
+    if (!m_impl->deviceReady)
+        return fail(QStringLiteral("没找到可用的音频输出设备"));
+
+    // 和 load() 同一条纪律：先停音频线程，再动 decoder / stream
+    if (ma_device_is_started(m_impl->device))
+        ma_device_stop(m_impl->device);
+
+    if (m_impl->shared.decoderReady.load())
+    {
+        ma_decoder_uninit(&m_impl->shared.decoder);
+        m_impl->shared.decoderReady.store(false);
+    }
+    delete m_impl->stream;
+    m_impl->stream = nullptr;
+
+    m_durationMs       = durationMs;
+    m_finishedReported = false;
+
+    m_impl->stream = new StreamFeed(url, headers);
+    m_impl->stream->setRestartHandler([this](qint64 off) {
+        // seek 可能从音频线程发起 —— 排到主线程再动网络对象
+        QMetaObject::invokeMethod(this, [this, off] { restartStreamAt(off); },
+                                  Qt::QueuedConnection);
+    });
+    m_impl->stream->start();
+
+    // ★ 等首块数据再初始化解码器 ★ ma_decoder_init 的探测读发生在**主线程**，
+    // 而数据靠主线程的事件循环送达 —— 不先缓冲的话，探测读在这里等网络
+    // = 自己锁死自己（本地事件收不到），5 秒超时后报"初始化失败"。
+    // processEvents（排除用户输入）转起来，网络事件就能进来；正常 100~300ms
+    // 就能拿到首块，UI 只是极短暂的无响应。
+    m_impl->stream->waitForFirstBytes(8000);
+
+    const ma_decoder_config dcfg = ma_decoder_config_init(kFormat, kChannels, kSampleRate);
+    if (ma_decoder_init(onStreamRead, onStreamSeek, m_impl->stream, &dcfg,
+                        &m_impl->shared.decoder) != MA_SUCCESS)
+    {
+        // 带上诊断：缓冲了 0 字节 = 下载就没成（网络/地址/风控）；
+        // 缓冲了 N 字节还失败 = 数据格式不被识别。
+        const QString diag = QStringLiteral("（已缓冲 %1 字节%2）")
+                                 .arg(m_impl->stream->bufferedBytes())
+                                 .arg(m_impl->stream->isFailed()
+                                          ? QStringLiteral("，下载出错：")
+                                                + m_impl->stream->errorText()
+                                          : QString());
+        delete m_impl->stream;
+        m_impl->stream = nullptr;
+        return fail(QStringLiteral("流式解码器初始化失败%1").arg(diag));
+    }
+
+    m_impl->shared.decoderReady.store(true);
+    m_impl->shared.playedFrames.store(0);
+    m_impl->shared.seekPending.store(false);
+    m_impl->shared.reachedEnd.store(false);
+
+    emit durationChanged(m_durationMs);
+    emit positionChanged(0);
+    emit stateChanged();
+    return true;
+}
+
+// 音频线程 seek 出缓冲区后，由这里重启 Range 续传（主线程）
+void AudioPlayer::restartStreamAt(qint64 byteOffset)
+{
+    if (m_impl && m_impl->stream)
+        m_impl->stream->restartAt(byteOffset);
 }
 
 bool AudioPlayer::hasTrack() const
