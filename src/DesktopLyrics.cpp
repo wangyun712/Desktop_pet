@@ -72,22 +72,19 @@ DesktopLyrics::DesktopLyrics(QWidget* parent)
     m_locked = ini().value(QStringLiteral("desktopLyrics/locked"), false).toBool();
 
     // 先定尺寸、再回位置 —— 位置夹取要用到窗口宽高
-    buildFixedSize();
+    buildDefaultSize();
     restorePosition();
 }
 
 // =============================================================================
-//  固定条带尺寸
+//  出场默认尺寸
 //
-//  ★ 窗口尺寸不跟歌词走，这是网易云桌面歌词的核心机制 ★
-//    宽度 = 所在屏幕可用宽的 60%（收口在 [420, 1100] 基准像素，随字号档位
-//    缩放）。定了就不变：换行只是原地换字（超长用"…"截断），没有任何窗口
-//    重配置 —— 之前"按文本改尺寸"的路线，哪怕合成一次 setGeometry，分层
-//    窗口重配置时旧内容仍会被系统拉伸一帧，肉眼看就是闪。固定尺寸从根上
-//    消掉了这个过程，中心轴也天然钉死。
-//    整个会话只有两处会重建尺寸：启动，和字号档位变化（罕见）。
+//  高度永远固定（工具条保留区 + 两行歌词 + 上下留白）；宽度只是**出场值** ——
+//  之后每次喂歌词都会按文字长度重算（updateWidth）。这里给一个中庸的默认宽
+//  （所在屏可用宽的 60%，收口在 [420, 1100] 基准像素），免得窗口在第一句
+//  歌词喂进来之前缩成一条缝。
 // =============================================================================
-void DesktopLyrics::buildFixedSize()
+void DesktopLyrics::buildDefaultSize()
 {
     // 认一下自己该在哪块屏上：优先按存档位置找屏，找不到用主屏
     const QSettings s = ini();
@@ -105,6 +102,49 @@ void DesktopLyrics::buildFixedSize()
 
     m_builtScale = UiFont::scalePercent();
     resize(w, h);
+}
+
+// =============================================================================
+//  宽度跟着歌词走
+//
+//  目标宽 = 当前句/下一句里较长那行的文字宽 + 两侧留白。为了把"窗口重配置"
+//  的代价压到最小（分层窗口 setGeometry 时旧内容会被系统拉伸一帧）：
+//    · 宽度向上量化到 16px 一档 —— 一档之内换行不重配，量化只向上保证
+//      量完仍装得下文字（装不下由 paintEvent 的"…"截断兜底）；
+//    · 拖动中 / 未锁悬停时冻结，等 mouseRelease / leave 再补算 ——
+//      挪+缩同时进行会跟手打架，悬停中改宽可能把鼠标甩出窗外；
+//    · 中心轴钉死：只改宽，窗口中心 X 和顶边 Y 都不动（桌面歌词就是
+//      绕一条中轴看的），贴屏幕边时不许伸出去。
+// =============================================================================
+void DesktopLyrics::updateWidth()
+{
+    if (m_dragging || (m_hovered && !m_locked))
+        return;
+
+    QFontMetrics fmc(lineFont(kCurFontPx));
+    int textW = fmc.horizontalAdvance(m_cur);
+    if (!m_next.isEmpty())
+        textW = qMax(textW, QFontMetrics(lineFont(kNextFontPx)).horizontalAdvance(m_next));
+
+    QScreen* scr = screen();
+    const int availW = scr ? scr->availableGeometry().width() : 1200;
+    const int minW   = qMin(UiFont::px(300), availW / 4);   // 短句别缩成一条缝
+    const int maxW   = qMax(minW, qMin(int(availW * 0.9), UiFont::px(1100)));
+
+    int target = qBound(minW, textW + 2 * kPad + UiFont::px(8), maxW);
+    target     = qBound(minW, (target + 15) / 16 * 16, maxW);   // 向上量化到 16px 档
+    if (target == width())
+        return;
+
+    // 中心轴钉死：newLeft = 旧中心 - 新宽/2；贴边时夹回屏幕内
+    int nx = x() + (width() - target) / 2;
+    if (scr)
+    {
+        const QRect avail = scr->availableGeometry();
+        nx = qBound(avail.left(), nx, qMax(avail.left(), avail.right() + 1 - target));
+    }
+    setGeometry(nx, y(), target, height());
+    update();                          // 立刻按新宽重画，不给"旧内容拉伸一帧"留口子
 }
 
 // =============================================================================
@@ -127,10 +167,11 @@ void DesktopLyrics::setLine(const QString& current, const QString& next)
         return;
     }
 
-    // ★ 不改窗口几何 ★ —— 条带是固定宽的，换行只是原地换字（超长截断）。
-    // 唯一的例外：字号档位变了，重建一次尺寸（整个会话难得一遇）。
+    // ★ 改宽度 ★ —— 宽度跟着这行的文字长度走（量化到 16px 档、中心轴不动）。
+    // 字号档位变了的话先重建基础尺寸（整个会话难得一遇）。
     if (m_builtScale != UiFont::scalePercent())
-        buildFixedSize();
+        buildDefaultSize();
+    updateWidth();
 
     if (!isVisible())
         show();
@@ -205,8 +246,8 @@ void DesktopLyrics::paintEvent(QPaintEvent* event)
         paintToolbar(p);
 
     // ---- 歌词两行（描边字，压得住任何壁纸）----
-    // 条带是固定宽的：放得下就整句居中，放不下就"…"截断（网易云同款）。
-    // 文字永远以条带中心轴居中 —— 轴是窗口的，窗口又从不移动。
+    // 宽度是跟文字走的（见 updateWidth）：装得下就整句居中，极端情况
+    //（宽被上限压住）用"…"截断兜底。文字永远以窗口中心轴居中 —— 轴是钉死的。
     const int maxTextW = width() - 2 * kPad;
 
     int y = kToolbarH + kPad;
@@ -399,6 +440,7 @@ void DesktopLyrics::leaveEvent(QEvent* event)
     m_hovered  = false;
     m_hoverBtn = -1;
     update();                          // 工具条收起
+    updateWidth();                     // 悬停期间冻结的宽度在这里补算
 }
 
 void DesktopLyrics::mousePressEvent(QMouseEvent* event)
@@ -469,6 +511,7 @@ void DesktopLyrics::mouseReleaseEvent(QMouseEvent* event)
     {
         m_dragging = false;
         savePosition();                // 松手就记，中途关程序位置也不丢
+        updateWidth();                 // 拖动期间冻结的宽度在这里补算
         event->accept();
         return;
     }

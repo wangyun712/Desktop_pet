@@ -103,10 +103,11 @@ public:
     void fallbackBilibili(const QString& keyword, const QString& dir,
                           bool registerFav, bool play);
 
-    // ---- 我的下载（仅下载/收藏落盘的歌都在这里，可删除）----
+    // ---- 我的下载（储存盘整个目录扫描出来，可删除）----
+    // ★ 不存元数据索引 ★ 每次打开都重新扫描储存盘：文件系统就是唯一的账本，
+    // 人为改名/挪动/增删文件之后这里照样能找到（改的是哪份账就是哪份）。
     void showDownloads(bool on);                   // 我的下载视图
-    void removeDownloaded(int libIndex);           // 删除：删文件 + 剔索引 + 出曲库
-    void addDownloaded(const QString& title, const QString& artist, const QString& path);
+    void removeDownloaded(int libIndex);           // 删除：删文件（.lrc 侧车一起）+ 出曲库
     bool ensureSaveDir();                          // 没选过储存盘就弹目录框（记住）
     void showFavorites(bool on);                   // 「我的收藏」视图
     void addFavorite(const QString& title, const QString& artist, const QString& path);
@@ -233,6 +234,7 @@ private:
     QLabel*      m_coverLabel = nullptr;
     QLabel*      m_nowLabel   = nullptr;
     PlayerIconButton* m_modeBtn = nullptr;   // 播放模式（随机 / 顺序 / 单曲循环）
+    QPushButton* m_dtLyricsBtn = nullptr;    // 「词」：桌面歌词开关（在上一首左边，开/关同设置页联动）
     PlayerIconButton* m_prevBtn = nullptr;
     PlayerIconButton* m_playBtn = nullptr;
     PlayerIconButton* m_nextBtn = nullptr;

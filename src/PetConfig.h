@@ -156,6 +156,13 @@ constexpr int MENU_IDLE_MS       = 0;      // 0 = 一直待机（不定时）
 //（对照上面「图片编号 -> 路径」那张表，比如 13 是打瞌睡、21 是飞行）。
 constexpr int TRAY_ICON_IMG      = 8;      // 8 = 08_站立.png
 
+// ---------- 应用头像（窗口/任务栏/exe 图标共用的裁切框）----------
+// 从站立图(08)裁出"脸那一块"做头像：窗口图标、任务栏、exe 文件图标都用它。
+// 裁切框的量法见 ChatPage::makeAvatar 的注释（眼睛重心 (83,116)，中心下移到下巴）。
+constexpr int AVATAR_FACE_X = 38;
+constexpr int AVATAR_FACE_Y = 81;
+constexpr int AVATAR_FACE_S = 90;
+
 // ---------- 行走序列（22~29 这 8 张图）----------
 //
 //  ★ 一次完整的走路不是「22→29 顺序循环」，而是三个阶段：★

@@ -14,6 +14,7 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QApplication>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -847,6 +848,18 @@ void PlayerPage::buildUi()
     //   · 上一首/下一首 32px，无底色，hover 才浮出一个浅灰圆；
     //   · 尺寸给的是像素而不是跟着字号缩放 —— 这几个键是"点得到"的靶子，
     //     缩太小会难点中；图标本身是矢量，不会因为按钮小而糊。
+    // 「词」= 桌面歌词开关（在上一首左边）。点一下开、再点一下关；
+    // 状态和设置页那个勾选框是同一条链（setDesktopLyricsEnabled 落盘 + 广播），
+    // 两边谁动都会把对方刷齐。选中态底色换成强调色实底 —— 开/关一眼可辨。
+    m_dtLyricsBtn = new QPushButton(QStringLiteral("词"), this);
+    m_dtLyricsBtn->setObjectName(QStringLiteral("playerLyricsToggle"));
+    m_dtLyricsBtn->setCheckable(true);
+    m_dtLyricsBtn->setFixedSize(32, 32);
+    m_dtLyricsBtn->setCursor(Qt::PointingHandCursor);
+    m_dtLyricsBtn->setToolTip(QStringLiteral("桌面歌词（点一下开，再点一下关；与设置页联动）"));
+    m_dtLyricsBtn->setChecked(m_dtLyricsEnabled);   // 先置态再接线：启动时不触发落盘/广播
+    connect(m_dtLyricsBtn, &QPushButton::toggled, this, &PlayerPage::setDesktopLyricsEnabled);
+
     m_prevBtn = new PlayerIconButton(PlayIconKind::Prev, 32, this);
     m_prevBtn->setObjectName(QStringLiteral("playerTransport"));
     m_prevBtn->setToolTip(QStringLiteral("上一首"));
@@ -885,6 +898,7 @@ void PlayerPage::buildUi()
     bar->addWidget(m_modeBtn);
     bar->addWidget(m_coverLabel);
     bar->addLayout(infoCol, 1);
+    bar->addWidget(m_dtLyricsBtn);
     bar->addWidget(m_prevBtn);
     bar->addWidget(m_playBtn);
     bar->addWidget(m_nextBtn);
@@ -983,6 +997,20 @@ void PlayerPage::applyStyle()
         }
         QPushButton#playerFav:hover   { border-color: #7F77DD; color: #534AB7; }
         QPushButton#playerFav:checked { background: #EEEDFE; color: #534AB7; border-color: #7F77DD; }
+
+        /* 桌面歌词开关（播放条上的「词」）：关 = 白底中性字，开 = 强调色实底白字
+           —— 开/关必须一眼可辨，所以选中态不用浅底，直接上强调色实底 */
+        QPushButton#playerLyricsToggle {
+            border: 1px solid #E3E1D9; border-radius: 6px;
+            background: #FFFFFF; color: #6B6A63;
+            font-size: 13px;
+        }
+        QPushButton#playerLyricsToggle:hover {
+            border-color: #7F77DD; color: #534AB7;
+        }
+        QPushButton#playerLyricsToggle:checked {
+            background: #534AB7; color: #FFFFFF; border-color: #534AB7;
+        }
 
         QLineEdit#playerSearch {
             border: 1px solid #E3E1D9; border-radius: 6px;
@@ -1143,12 +1171,6 @@ void PlayerPage::paintEvent(QPaintEvent* event)
         // KeepAspectRatioByExpanding：等比放大到铺满，多出来的边裁掉。
         // 用 Stretch 会把封面拉变形，宁可裁。
         // ★ 平滑插值（SmoothTransformation），别用最近邻 ★
-        //   曾经为了 resize 跟手刻意用最近邻（拖窗口边缘一次拖动会来上百次
-        //   resize，当时怕平滑缩放拖慢）——但源图已经预先缩到 ≤1280（见
-        //   loadLyricsAndCover / themeFallbackCover），从这里平滑缩到窗口尺寸
-        //   只有一两毫秒，完全在每帧预算内；而最近邻扔像素带来的锯齿和马赛克
-        //   是肉眼实打实看得见的。清晰度归清晰度，透明度归透明度 —— 这层图
-        //   只该淡，不该糊。
         m_bgCache = m_bgCover.scaled(size(), Qt::KeepAspectRatioByExpanding,
                                      Qt::SmoothTransformation);
         m_bgCacheSize = size();
@@ -2003,6 +2025,15 @@ void PlayerPage::updateDesktopLyrics()
 void PlayerPage::setDesktopLyricsEnabled(bool on)
 {
     m_dtLyricsEnabled = on;
+
+    // 播放条上的「词」按钮跟着走（按钮自己触发的那次已经是对的状态，跳过防回环）
+    if (m_dtLyricsBtn && m_dtLyricsBtn->isChecked() != on)
+    {
+        m_dtLyricsBtn->blockSignals(true);
+        m_dtLyricsBtn->setChecked(on);
+        m_dtLyricsBtn->blockSignals(false);
+    }
+
     DesktopLyrics::saveEnabled(on);    // 立刻落盘 —— 和字号/主题一个规矩
     updateDesktopLyrics();             // 开了就立刻按当前状态显示，不用等下一句
 
@@ -2222,6 +2253,9 @@ struct Sample
 };
 
 } // namespace
+
+// 定义在收藏/下载索引那一段（本文件后面）；describePlayer 第 ⑤ 节要用到它
+static QVector<int> scanDownloadDir(const QString& dir, MusicLibrary* lib);
 
 QString PlayerPage::describePlayer()
 {
@@ -2468,23 +2502,23 @@ QString PlayerPage::describePlayer()
                                                        : QStringLiteral("!!"), s.fileName);
         out += QStringLiteral("       标签来源 %1 ｜ 标题「%2」%3 ｜ 艺术家「%4」%5 ｜ "
                               "时长 %6 ms（期望 %7）%8 ｜ 封面 %9 ｜ 歌词 %10\r\n")
-                   .arg(m.tagSource.isEmpty() ? QStringLiteral("(无)") : m.tagSource)
-                   .arg(m.title)
-                   .arg(titleOk ? QString() : QStringLiteral(" ← 不对"))
-                   .arg(m.artist.isEmpty() ? QStringLiteral("(空)") : m.artist)
-                   .arg(artistOk ? QString() : QStringLiteral(" ← 不对"))
+                   .arg(m.tagSource.isEmpty() ? QStringLiteral("(无)") : m.tagSource,
+                        m.title,
+                        titleOk ? QString() : QStringLiteral(" ← 不对"),
+                        m.artist.isEmpty() ? QStringLiteral("(空)") : m.artist,
+                        artistOk ? QString() : QStringLiteral(" ← 不对"))
                    .arg(m.durationMs)
                    .arg(s.durationMs)
-                   .arg(durOk ? QString() : QStringLiteral(" ← 不对"))
-                   .arg(m.hasCover() ? (coverOk ? QStringLiteral("有")
+                   .arg(durOk ? QString() : QStringLiteral(" ← 不对"),
+                        m.hasCover() ? (coverOk ? QStringLiteral("有")
                                                 : QStringLiteral("有(不该有)"))
                                      : (coverOk ? QStringLiteral("无")
-                                                : QStringLiteral("无(应该有)")))
-                   .arg(m.lyricSource.isEmpty()
-                            ? (lyricOk ? QStringLiteral("无") : QStringLiteral("无(应该有)"))
-                            : QStringLiteral("%1(%2)").arg(lyricOk ? QStringLiteral("有")
-                                                                   : QStringLiteral("有(不该有)"),
-                                                           m.lyricSource));
+                                                : QStringLiteral("无(应该有)")),
+                        m.lyricSource.isEmpty()
+                                 ? (lyricOk ? QStringLiteral("无") : QStringLiteral("无(应该有)"))
+                                 : QStringLiteral("%1(%2)").arg(lyricOk ? QStringLiteral("有")
+                                                                        : QStringLiteral("有(不该有)"),
+                                                                m.lyricSource));
     }
 
     out += QStringLiteral("  小结：%1 / %2 个样本完全对上").arg(passed).arg(samples.size());
@@ -2606,6 +2640,131 @@ QString PlayerPage::describePlayer()
                               "占不到 1%），所以搜索用的是 QString::contains —— 不引更重的索引结构，"
                               "换来的复杂度不划算。\r\n")
                    .arg(usFull);
+    }
+
+    // ---------------- ⑤ 我的下载扫描 ----------------
+    // 「我的下载」不存元数据索引，每次打开都直接扫储存盘（scanDownloadDir）。
+    // 这里现场造一个"储存盘"，把用户最关心的两个场景各跑一遍：
+    //   · 人为改了文件名，还能不能找到 —— 改完再扫，按磁盘现状出列表；
+    //   · 中间产物（.m4a 转码前 / .part 转码中）会不会混进列表 —— 不该混进来。
+    out += QStringLiteral("\r\n--- 我的下载扫描（临时目录当储存盘，现场改名实测）---\r\n");
+    {
+        const QString dlDir = tmp.path() + QStringLiteral("/dl_storage");
+        QDir().mkpath(dlDir);
+
+        // 样本 A：没有标签的 WAV，按全应用统一的文件名约定「艺术家 - 标题」命名，
+        // 验证 TrackMeta 的文件名兜底在扫描路径上同样生效
+        {
+            QFile wav(dlDir + QStringLiteral("/周杰伦 - 晴天.wav"));
+            if (wav.open(QIODevice::WriteOnly))
+            {
+                const quint32 sr = 8000, frames = 800;      // 0.1 秒静音，够解析就行
+                const quint32 dataLen = frames * 2;
+                const auto u32 = [&wav](quint32 v) {
+                    const char b[4] = { char(v), char(v >> 8), char(v >> 16), char(v >> 24) };
+                    wav.write(b, 4);
+                };
+                const auto u16 = [&wav](quint16 v) {
+                    const char b[2] = { char(v), char(v >> 8) };
+                    wav.write(b, 2);
+                };
+                wav.write("RIFF", 4); u32(36 + dataLen); wav.write("WAVE", 4);
+                wav.write("fmt ", 4); u32(16); u16(1); u16(1); u32(sr); u32(sr * 2); u16(2); u16(16);
+                wav.write("data", 4); u32(dataLen);
+                wav.write(QByteArray(int(dataLen), char(0)));
+            }
+        }
+        // 样本 B：直接复用上面标签解析节拼好的 MP3（有 ID3 标题/歌手标签）
+        QFile::copy(tmp.path() + QStringLiteral("/01 - 测试歌手 - 测试歌曲.mp3"),
+                    dlDir + QStringLiteral("/01 - 测试歌手 - 测试歌曲.mp3"));
+        // 干扰项：下载流程的中间产物，不应该被扫进"我的下载"
+        writeFile(dlDir + QStringLiteral("/中断下载.m4a"), QByteArray());
+        writeFile(dlDir + QStringLiteral("/转码中.flac.part"), QByteArray());
+
+        MusicLibrary lib;
+        const QVector<int> view1 = scanDownloadDir(dlDir, &lib);
+        QStringList titles1;
+        for (int i : view1)
+            if (const Track* t = lib.trackAt(i))
+                titles1 << t->title;
+        out += QStringLiteral("  首次扫描     : %1 首（%2），干扰项应被排除\r\n")
+                   .arg(view1.size()).arg(titles1.join(QStringLiteral("、")));
+        const bool firstOk = (view1.size() == 2
+                              && titles1.contains(QStringLiteral("测试歌曲"))
+                              && titles1.contains(QStringLiteral("晴天")));
+
+        // ★ 核心场景：人为改名 —— 不重灌任何元数据，再扫一遍就按磁盘现状出列表 ★
+        QFile::rename(dlDir + QStringLiteral("/周杰伦 - 晴天.wav"),
+                      dlDir + QStringLiteral("/我改过名的歌.wav"));
+        const QVector<int> view2 = scanDownloadDir(dlDir, &lib);
+        QStringList titles2;
+        for (int i : view2)
+            if (const Track* t = lib.trackAt(i))
+                titles2 << t->title;
+        out += QStringLiteral("  改名后再扫   : %1 首（%2）\r\n")
+                   .arg(view2.size()).arg(titles2.join(QStringLiteral("、")));
+        const bool renameOk = (view2.size() == 2
+                               && titles2.contains(QStringLiteral("我改过名的歌"))
+                               && titles2.contains(QStringLiteral("测试歌曲")));
+
+        out += (firstOk && renameOk)
+                   ? QStringLiteral("  [OK] 扫描加载正常：改名后照样找到，中间产物被排除\r\n")
+                   : QStringLiteral("  [!!] 扫描结果不对 —— 检查 scanDownloadDir\r\n");
+    }
+
+    // ---------------- ⑥ 桌面歌词（动态宽度 + 播放条「词」开关）----------------
+    //  两件事都能离屏验证：
+    //   · 动态宽度：短句收窄、长句撑宽，窗口中心轴必须钉死不动；
+    //   · 「词」按钮：setDesktopLyricsEnabled 是按钮和设置页共用的同一条链，
+    //     开/关一轮，按钮选中态和落盘值必须都跟上（测完拨回原值不弄脏存档）。
+    out += QStringLiteral("\r\n--- 桌面歌词（动态宽度 + 「词」开关）---\r\n");
+    {
+        DesktopLyrics dl;
+        dl.setAttribute(Qt::WA_DontShowOnScreen, true);
+        dl.show();
+        // 挪到屏幕水平中央再测：中心轴不变性不该被"贴边夹回屏幕"干扰
+        //（贴边时为了不出屏允许轴移动，那是另一条规矩，下面单独断言）
+        if (QScreen* scr = dl.screen())
+        {
+            const QRect avail = scr->availableGeometry();
+            dl.move(avail.center().x() - dl.width() / 2, avail.top() + 40);
+        }
+        QApplication::processEvents();
+        const int cx0 = dl.x() + dl.width() / 2;
+
+        dl.setLine(QStringLiteral("短"), QString());
+        QApplication::processEvents();
+        const int wShort = dl.width();
+
+        const QString longLine = QStringLiteral("这是一句特别特别长的歌词，专门用来把窗口撑宽。").repeated(3);
+        dl.setLine(longLine, QStringLiteral("下一句也按较长那行参与计算"));
+        QApplication::processEvents();
+        const int wLong = dl.width();
+        const int cx1   = dl.x() + dl.width() / 2;
+        dl.setLine(QString(), QString());          // 收窗还原
+
+        // 两种宽度下窗口都必须完整落在所在屏的可用区里（不出屏）
+        const QRect availNow = dl.screen() ? dl.screen()->availableGeometry() : QRect();
+        const bool inScreen  = dl.x() >= availNow.left()
+                               && dl.x() + dl.width() <= availNow.right() + 1;
+        out += QStringLiteral("  短句宽=%1  长句宽=%2  中心轴偏移=%3px  不出屏=%4\r\n")
+                   .arg(wShort).arg(wLong).arg(qAbs(cx1 - cx0))
+                   .arg(inScreen ? QStringLiteral("是") : QStringLiteral("否"));
+        out += (wLong > wShort && qAbs(cx1 - cx0) <= 1 && inScreen)
+                   ? QStringLiteral("  [OK] 宽度跟歌词走、中心轴钉死、不出屏\r\n")
+                   : QStringLiteral("  [!!] 宽度没跟上/中心轴动了/出屏了 —— 检查 updateWidth\r\n");
+
+        PlayerPage probe;
+        const bool origOn = DesktopLyrics::loadEnabled();
+        probe.setDesktopLyricsEnabled(true);
+        QPushButton* wordBtn =
+            probe.findChild<QPushButton*>(QStringLiteral("playerLyricsToggle"));
+        const bool onOk  = wordBtn && wordBtn->isChecked() && DesktopLyrics::loadEnabled();
+        probe.setDesktopLyricsEnabled(origOn);     // 测完拨回原值，不弄脏用户存档
+        const bool offOk = wordBtn && wordBtn->isChecked() == origOn;
+        out += (onOk && offOk)
+                   ? QStringLiteral("  [OK] 「词」按钮随开关联动（选中态 + 落盘）\r\n")
+                   : QStringLiteral("  [!!] 「词」按钮没跟上开关 —— 检查 setDesktopLyricsEnabled\r\n");
     }
 
     return out;
@@ -2750,7 +2909,7 @@ void PlayerPage::playOnlineRow(int row)
 }
 
 // =============================================================================
-//  联网行落地：下载 → （B站经 MF 转 WAV）→ 入库 → （可选收藏/播放）
+//  联网行落地：下载 → （B站经 MF + libFLAC 转 FLAC）→ 入库 → （可选收藏/播放）
 // =============================================================================
 void PlayerPage::fetchAndPlay(int row, const TrackListModel::OnlineTrack& it,
                               const QString& dir, bool registerFav, bool play)
@@ -2784,21 +2943,26 @@ void PlayerPage::fetchAndPlay(int row, const TrackListModel::OnlineTrack& it,
                     return;
                 }
 
-                // B 站：M4S(AAC) → Media Foundation → WAV（miniaudio 只认 MP3/FLAC/WAV）
+                // B 站：M4S(AAC) → Media Foundation + libFLAC → FLAC（后台线程，不卡 UI）
                 if (suffix == QStringLiteral("m4s"))
                 {
-                    const QString wavPath = dir + QLatin1Char('/') + base + QStringLiteral(".wav");
-                    QString decodeErr;
-                    if (!MfDecode::decodeToWav(savePath, wavPath, &decodeErr))
-                    {
-                        setTag(QStringLiteral("该资源无法播放"));
-                        QFile::remove(savePath);
-                        return;
-                    }
-                    QFile::remove(savePath);           // 中间产物不留
-                    finishOnlineTrack(it, wavPath, dir, registerFav, play, refreshList);
-                    if (play && dir == OnlineMusic::tempDir())
-                        m_model->setPlayingOnlineId(it.id);   // B站行原地高亮（列表不刷）
+                    const QString flacPath = dir + QLatin1Char('/') + base + QStringLiteral(".flac");
+                    setTag(QStringLiteral("转码中"));
+                    MfDecode::decodeToFlacAsync(this, savePath, flacPath, it.title, it.artist,
+                        [this, it, savePath, flacPath, dir, registerFav, play, refreshList, setTag]
+                        (bool ok, const QString& err) {
+                            Q_UNUSED(err);
+                            if (!ok)
+                            {
+                                setTag(QStringLiteral("该资源无法播放"));
+                                QFile::remove(savePath);
+                                return;
+                            }
+                            QFile::remove(savePath);           // 中间产物不留
+                            finishOnlineTrack(it, flacPath, dir, registerFav, play, refreshList);
+                            if (play && dir == OnlineMusic::tempDir())
+                                m_model->setPlayingOnlineId(it.id);   // B站行原地高亮（列表不刷）
+                        });
                     return;
                 }
 
@@ -2881,18 +3045,24 @@ void PlayerPage::fetchAndPlay(int row, const TrackListModel::OnlineTrack& it,
                     return;
                 }
 
-                // ★ B 站必须下载（AAC）→ 转好放进「我的下载」，下次直接读本地 ★
+                // ★ B 站必须下载（AAC）→ 转成 FLAC 放进「我的下载」，下次直接读本地 ★
                 if (!ensureSaveDir())
                 {
                     setTag(QStringLiteral("未选择保存文件夹"));
                     return;
                 }
 
-                const QString base    = OnlineMusic::sanitizeFileName(
+                const QString base     = OnlineMusic::sanitizeFileName(
                     it.title + QStringLiteral(" - ") + it.artist);
-                const QString wavPath = m_saveDir + QLatin1Char('/') + base + QStringLiteral(".wav");
+                const QString flacPath = m_saveDir + QLatin1Char('/') + base + QStringLiteral(".flac");
+                const QString wavPath  = m_saveDir + QLatin1Char('/') + base + QStringLiteral(".wav");
 
-                // 下次再点同一首：本地已有转好的 WAV → 直接读它，不再下载
+                // 下次再点同一首：本地已有转好的 FLAC（或老版本存的 WAV）→ 直接读它，不再下载
+                if (QFileInfo::exists(flacPath))
+                {
+                    playLocalWav(it, flacPath, registerFav, play);
+                    return;
+                }
                 if (QFileInfo::exists(wavPath))
                 {
                     playLocalWav(it, wavPath, registerFav, play);
@@ -2906,30 +3076,35 @@ void PlayerPage::fetchAndPlay(int row, const TrackListModel::OnlineTrack& it,
                             m_model->setOnlineTag(row,
                                 QStringLiteral("下载中 %1%").arg(int(got * 100 / total)));
                     },
-                    [this, it, row, m4aPath, wavPath, registerFav, play, setTag](bool ok, const QString& err) {
+                    [this, it, row, m4aPath, flacPath, registerFav, play, setTag](bool ok, const QString& err) {
                         if (!ok)
                         {
                             setTag(QStringLiteral("联网失败·%1").arg(netErrText(err)));
                             return;
                         }
-                        QString decodeErr;
-                        if (!MfDecode::decodeToWav(m4aPath, wavPath, &decodeErr))
-                        {
-                            setTag(QStringLiteral("该资源无法播放"));
-                            QFile::remove(m4aPath);
-                            return;
-                        }
-                        QFile::remove(m4aPath);            // 中间产物不留
-                        playLocalWav(it, wavPath, registerFav, play);
+                        setTag(QStringLiteral("转码中"));
+                        MfDecode::decodeToFlacAsync(this, m4aPath, flacPath, it.title, it.artist,
+                            [this, it, m4aPath, flacPath, registerFav, play, setTag]
+                            (bool ok, const QString& err) {
+                                Q_UNUSED(err);
+                                if (!ok)
+                                {
+                                    setTag(QStringLiteral("该资源无法播放"));
+                                    QFile::remove(m4aPath);
+                                    return;
+                                }
+                                QFile::remove(m4aPath);            // 中间产物不留
+                                playLocalWav(it, flacPath, registerFav, play);
+                            });
                     });
             });
     }
 }
 
 // =============================================================================
-//  B 站落地后的播放：WAV 已在储存盘 → 入库（不广播）→ 播放 + 联网行高亮
+//  B 站落地后的播放：音频文件（FLAC/老 WAV）已在储存盘 → 入库（不广播）→ 播放
 //
-//  ★ 下次再点同一首 B 站结果：wavPath 已存在 → 直接走这里读本地文件 ★
+//  ★ 下次再点同一首 B 站结果：flacPath/wavPath 已存在 → 直接走这里读本地 ★
 //  不再下载、不再转码。
 // =============================================================================
 void PlayerPage::playLocalWav(const TrackListModel::OnlineTrack& it, const QString& wavPath,
@@ -2950,7 +3125,8 @@ void PlayerPage::playLocalWav(const TrackListModel::OnlineTrack& it, const QStri
         registerFav ? QStringLiteral("收藏") : QStringLiteral("已下载"));
     if (registerFav)
         addFavorite(it.title, it.artist, wavPath);
-    addDownloaded(it.title, it.artist, wavPath);
+    // 「我的下载」无需登记：视图每次打开都直接扫描储存盘（见 scanDownloadDir），
+    // 落盘的文件自然会出现。
 
     if (play)
     {
@@ -3005,8 +3181,8 @@ void PlayerPage::finishOnlineTrack(const TrackListModel::OnlineTrack& it, const 
 
     if (registerFav)
         addFavorite(it.title, it.artist, path);
-    if (savedToDisk)
-        addDownloaded(it.title, it.artist, path);   // 收藏/仅下载都登记进"我的下载"
+    // 「我的下载」无需登记：视图每次打开都直接扫描储存盘（见 scanDownloadDir），
+    // 下载落盘的文件自然会出现（savedToDisk 只用于上面的"已下载"徽标）。
 
     // ★ 刷新列表只发生在"落盘"的场合 ★ 流式/临时播放不刷 —— 联网结果保持
     // 原样，正在播的那行高亮（setPlayingOnlineId 由调用方补一下）。
@@ -3021,30 +3197,180 @@ void PlayerPage::finishOnlineTrack(const TrackListModel::OnlineTrack& it, const 
 }
 
 // =============================================================================
+//  收藏索引文件（%APPDATA%/PetPal/favorites.ini）
+//
+//  收藏是"用户在这台机器上打的标记"，文件系统扫不出来，所以还走索引。
+//  「我的下载」不走索引 —— 它就是储存盘目录本身，每次打开直接扫（见
+//  scanDownloadDir），人为改名之后照样找得到（用户要求，2026-09-28）。
+// =============================================================================
+struct IndexEntry
+{
+    QString title, artist, path;
+};
+
+// 原样读出一个索引（条目数组）
+static QVector<IndexEntry> readIndex(const QString& appName)
+{
+    QSettings ini(QSettings::IniFormat, QSettings::UserScope,
+                  QStringLiteral("PetPal"), appName);
+    const int n = ini.beginReadArray(appName);
+    QVector<IndexEntry> out;
+    out.reserve(n);
+    for (int i = 0; i < n; ++i)
+    {
+        ini.setArrayIndex(i);
+        out.append({ ini.value(QStringLiteral("title")).toString(),
+                     ini.value(QStringLiteral("artist")).toString(),
+                     ini.value(QStringLiteral("path")).toString() });
+    }
+    ini.endArray();
+    return out;
+}
+
+// 整组重写（剔除丢失条目 / 追加新条目都走这里）
+static void writeIndex(const QString& appName, const QVector<IndexEntry>& entries)
+{
+    QSettings ini(QSettings::IniFormat, QSettings::UserScope,
+                  QStringLiteral("PetPal"), appName);
+    ini.beginWriteArray(appName, entries.size());
+    for (int i = 0; i < entries.size(); ++i)
+    {
+        ini.setArrayIndex(i);
+        ini.setValue(QStringLiteral("title"), entries.at(i).title);
+        ini.setValue(QStringLiteral("artist"), entries.at(i).artist);
+        ini.setValue(QStringLiteral("path"), entries.at(i).path);
+    }
+    ini.endArray();
+}
+
+// 登记一条（按路径去重；收藏 / 下载共用）
+static void indexAppend(const QString& appName, const QString& title,
+                        const QString& artist, const QString& path)
+{
+    QVector<IndexEntry> all = readIndex(appName);
+    for (const IndexEntry& e : std::as_const(all))    // as_const：只读遍历别让容器 detach
+        if (e.path == path)
+            return;                            // 已经登记过：不重复
+
+    all.append({ title, artist, path });
+    writeIndex(appName, all);
+}
+
+// 从索引里剔除某条路径（删除歌曲时：下载 / 收藏两个索引都要过一遍）
+static void pruneIndexFile(const QString& appName, const QString& path)
+{
+    QVector<IndexEntry> all = readIndex(appName);
+    QVector<IndexEntry> kept;
+    for (const IndexEntry& e : std::as_const(all))    // as_const：只读遍历别让容器 detach
+        if (e.path != path)
+            kept.append(e);
+    if (kept.size() != all.size())
+        writeIndex(appName, kept);
+}
+
+// 载入一个索引到曲库/列表视图：文件还在的条目返回曲库下标，
+// 没进过曲库的现读元数据补进来；丢失条目顺路从索引剔除。
+static QVector<int> loadIndexIntoView(const QString& appName, MusicLibrary* lib)
+{
+    QVector<IndexEntry> kept;
+    QVector<Track>      inject;
+    QVector<int>        view;
+    const int           base = lib->count();
+
+    for (const IndexEntry& e : readIndex(appName))
+    {
+        if (!QFileInfo::exists(e.path))
+            continue;                          // 文件没了：剔除
+
+        int libIndex = lib->indexOfPath(e.path);
+        if (libIndex < 0)
+        {
+            const TrackMeta::Meta meta = TrackMeta::readMeta(e.path);
+            Track t;
+            t.path       = e.path;
+            t.title      = meta.title.isEmpty() ? QFileInfo(e.path).completeBaseName()
+                                                : meta.title;
+            t.artist     = meta.artist;
+            t.durationMs = meta.durationMs;
+            inject.append(t);
+            libIndex = base + inject.size() - 1;
+        }
+        view.append(libIndex);
+        kept.append(e);
+    }
+
+    if (!inject.isEmpty())
+        lib->appendBatch(inject);
+    writeIndex(appName, kept);                 // 丢失条目的剔除在这里落盘
+
+    return view;
+}
+
+// =============================================================================
+//  我的下载 —— 每次打开都直接扫储存盘，不存元数据索引
+//
+//  为什么不学收藏那样存一份索引：索引里存的是"路径+标题"的快照，用户把文件
+//  改个名，快照就和磁盘对不上了。储存盘目录本身就是账本 —— 每次打开
+//  「我的下载」重新扫一遍，改名/挪动/增删之后这里永远反映磁盘的真实状态
+//  （用户要求，2026-09-28）。
+//
+//  只认 miniaudio 能播的 mp3/flac/wav：m4a/aac 扫进来也播不了，而且 .m4a
+//  正是下载流程的中间产物（转码前），不该出现在列表里；.part 是转码中残件，
+//  后缀天然不在名单里。标题/歌手/时长交给 TrackMeta::readMeta —— 标签优先，
+//  没标签按全应用统一的文件名约定兜底（「艺术家 - 标题」，见 TrackMeta.h），
+//  和本地曲库的显示规则完全一致。
+// =============================================================================
+static QVector<int> scanDownloadDir(const QString& dir, MusicLibrary* lib)
+{
+    static const QStringList kPlayable = {
+        QStringLiteral("mp3"), QStringLiteral("flac"), QStringLiteral("wav"),
+    };
+
+    QVector<int> view;
+    if (dir.isEmpty() || !QFileInfo::exists(dir))
+        return view;
+
+    // 按文件名排序再入列：目录枚举顺序不稳定，排一遍每次打开顺序都一致
+    const QFileInfoList files = QDir(dir).entryInfoList(
+        QDir::Files | QDir::NoDotAndDotDot, QDir::Name | QDir::IgnoreCase);
+
+    QVector<Track> inject;
+    const int base = lib->count();
+    int injected   = 0;
+
+    for (const QFileInfo& fi : files)
+    {
+        if (!kPlayable.contains(fi.suffix(), Qt::CaseInsensitive))
+            continue;
+
+        const QString path = fi.absoluteFilePath();
+        int libIndex = lib->indexOfPath(path);
+        if (libIndex < 0)
+        {
+            // 曲库里还没有的文件才读一遍标签（readMeta 要开文件，能省则省）
+            const TrackMeta::Meta meta = TrackMeta::readMeta(path);
+            Track t;
+            t.path       = path;
+            t.title      = meta.title.isEmpty() ? fi.completeBaseName() : meta.title;
+            t.artist     = meta.artist;
+            t.durationMs = meta.durationMs;
+            inject.append(t);
+            libIndex = base + injected++;
+        }
+        view.append(libIndex);
+    }
+
+    if (!inject.isEmpty())
+        lib->appendBatch(inject);
+    return view;
+}
+
+// =============================================================================
 //  收藏 / 我的收藏
 // =============================================================================
 void PlayerPage::addFavorite(const QString& title, const QString& artist, const QString& path)
 {
-    QSettings ini(QSettings::IniFormat, QSettings::UserScope,
-                  QStringLiteral("PetPal"), QStringLiteral("favorites"));
-    const int n = ini.beginReadArray(QStringLiteral("favorites"));
-    for (int i = 0; i < n; ++i)
-    {
-        ini.setArrayIndex(i);
-        if (ini.value(QStringLiteral("path")).toString() == path)
-        {
-            ini.endArray();
-            return;                    // 已经收藏过：不重复登记
-        }
-    }
-    ini.endArray();
-
-    ini.beginWriteArray(QStringLiteral("favorites"), n + 1);
-    ini.setArrayIndex(n);
-    ini.setValue(QStringLiteral("title"), title);
-    ini.setValue(QStringLiteral("artist"), artist);
-    ini.setValue(QStringLiteral("path"), path);
-    ini.endArray();
+    indexAppend(QStringLiteral("favorites"), title, artist, path);
 }
 
 void PlayerPage::showFavorites(bool on)
@@ -3072,59 +3398,8 @@ void PlayerPage::showFavorites(bool on)
         return;
     }
 
-    // 读收藏索引：文件还在的进列表，丢了的自动剔除（循环后整组重写索引）
-    QSettings ini(QSettings::IniFormat, QSettings::UserScope,
-                  QStringLiteral("PetPal"), QStringLiteral("favorites"));
-    const int n = ini.beginReadArray(QStringLiteral("favorites"));
-
-    struct FavEntry
-    {
-        QString title, artist, path;
-    };
-    QVector<FavEntry> kept;
-    QVector<Track>    inject;
-    QVector<int>      view;
-    const int         base = m_lib->count();
-
-    for (int i = 0; i < n; ++i)
-    {
-        ini.setArrayIndex(i);
-        const QString path = ini.value(QStringLiteral("path")).toString();
-        if (!QFileInfo::exists(path))
-            continue;                  // 文件没了：剔除
-
-        int libIndex = m_lib->indexOfPath(path);
-        if (libIndex < 0)
-        {
-            // 文件在、但还没进过曲库：现读元数据补进来
-            const TrackMeta::Meta meta = TrackMeta::readMeta(path);
-            Track t;
-            t.path       = path;
-            t.title      = meta.title.isEmpty() ? QFileInfo(path).completeBaseName()
-                                                : meta.title;
-            t.artist     = meta.artist;
-            t.durationMs = meta.durationMs;
-            inject.append(t);
-            libIndex = base + inject.size() - 1;
-        }
-        view.append(libIndex);
-        kept.append({ ini.value(QStringLiteral("title")).toString(),
-                      ini.value(QStringLiteral("artist")).toString(), path });
-    }
-    ini.endArray();
-
-    if (!inject.isEmpty())
-        m_lib->appendBatch(inject);
-
-    ini.beginWriteArray(QStringLiteral("favorites"), kept.size());
-    for (int i = 0; i < kept.size(); ++i)
-    {
-        ini.setArrayIndex(i);
-        ini.setValue(QStringLiteral("title"), kept.at(i).title);
-        ini.setValue(QStringLiteral("artist"), kept.at(i).artist);
-        ini.setValue(QStringLiteral("path"), kept.at(i).path);
-    }
-    ini.endArray();
+    // 载入收藏索引：文件还在的进列表，丢了的自动剔除
+    const QVector<int> view = loadIndexIntoView(QStringLiteral("favorites"), m_lib);
 
     m_model->clearOnlineResults();
     m_model->setView(view);
@@ -3156,10 +3431,20 @@ void PlayerPage::onListMenu(const QPoint& pos)
     }
     else if (m_dlView)
     {
-        // 我的下载视图：右键删除（删文件 + 剔索引 + 出曲库）
+        // 我的下载视图：右键删除（删文件（.lrc 一起）+ 出曲库；下载不存索引无需剔）
         const int libIndex = idx.data(TrackListModel::LibraryIndexRole).toInt();
         menu.addAction(QStringLiteral("删除"), this, [this, libIndex] {
             removeDownloaded(libIndex);
+        });
+    }
+    else if (m_favView)
+    {
+        // 收藏视图：取消收藏 —— 只移出收藏列表，**不删文件**
+        //（文件在储存盘里，用户可能还想留着；想删去「我的下载」里右键删除）
+        const QString path = idx.data(TrackListModel::PathRole).toString();
+        menu.addAction(QStringLiteral("取消收藏"), this, [this, path] {
+            pruneIndexFile(QStringLiteral("favorites"), path);
+            showFavorites(true);       // 重新载入收藏视图（这行即时消失）
         });
     }
     else
@@ -3191,32 +3476,8 @@ bool PlayerPage::ensureSaveDir()
 }
 
 // =============================================================================
-//  我的下载（仅下载 / 收藏落盘的歌都在这里；列表里右键可删除）
+//  我的下载（= 储存盘目录本身；每次打开直接扫，列表里右键可删除）
 // =============================================================================
-void PlayerPage::addDownloaded(const QString& title, const QString& artist, const QString& path)
-{
-    QSettings ini(QSettings::IniFormat, QSettings::UserScope,
-                  QStringLiteral("PetPal"), QStringLiteral("downloads"));
-    const int n = ini.beginReadArray(QStringLiteral("downloads"));
-    for (int i = 0; i < n; ++i)
-    {
-        ini.setArrayIndex(i);
-        if (ini.value(QStringLiteral("path")).toString() == path)
-        {
-            ini.endArray();
-            return;                    // 已经登记过：不重复
-        }
-    }
-    ini.endArray();
-
-    ini.beginWriteArray(QStringLiteral("downloads"), n + 1);
-    ini.setArrayIndex(n);
-    ini.setValue(QStringLiteral("title"), title);
-    ini.setValue(QStringLiteral("artist"), artist);
-    ini.setValue(QStringLiteral("path"), path);
-    ini.endArray();
-}
-
 void PlayerPage::showDownloads(bool on)
 {
     m_dlView = on;
@@ -3242,96 +3503,12 @@ void PlayerPage::showDownloads(bool on)
         return;
     }
 
-    // 读下载索引：文件还在的进列表，丢了的自动剔除（循环后整组重写索引）
-    QSettings ini(QSettings::IniFormat, QSettings::UserScope,
-                  QStringLiteral("PetPal"), QStringLiteral("downloads"));
-    const int n = ini.beginReadArray(QStringLiteral("downloads"));
-
-    struct DlEntry
-    {
-        QString title, artist, path;
-    };
-    QVector<DlEntry> kept;
-    QVector<Track>   inject;
-    QVector<int>     view;
-    const int        base = m_lib->count();
-
-    for (int i = 0; i < n; ++i)
-    {
-        ini.setArrayIndex(i);
-        const QString path = ini.value(QStringLiteral("path")).toString();
-        if (!QFileInfo::exists(path))
-            continue;                  // 文件没了：剔除
-
-        int libIndex = m_lib->indexOfPath(path);
-        if (libIndex < 0)
-        {
-            const TrackMeta::Meta meta = TrackMeta::readMeta(path);
-            Track t;
-            t.path       = path;
-            t.title      = meta.title.isEmpty() ? QFileInfo(path).completeBaseName()
-                                                : meta.title;
-            t.artist     = meta.artist;
-            t.durationMs = meta.durationMs;
-            inject.append(t);
-            libIndex = base + inject.size() - 1;
-        }
-        view.append(libIndex);
-        kept.append({ ini.value(QStringLiteral("title")).toString(),
-                      ini.value(QStringLiteral("artist")).toString(), path });
-    }
-    ini.endArray();
-
-    if (!inject.isEmpty())
-        m_lib->appendBatch(inject);
-
-    ini.beginWriteArray(QStringLiteral("downloads"), kept.size());
-    for (int i = 0; i < kept.size(); ++i)
-    {
-        ini.setArrayIndex(i);
-        ini.setValue(QStringLiteral("title"), kept.at(i).title);
-        ini.setValue(QStringLiteral("artist"), kept.at(i).artist);
-        ini.setValue(QStringLiteral("path"), kept.at(i).path);
-    }
-    ini.endArray();
+    // 每次打开都重新扫储存盘：文件改了名、挪了位置、增删了，这里都跟磁盘一致
+    const QVector<int> view = scanDownloadDir(m_saveDir, m_lib);
 
     m_model->clearOnlineResults();
     m_model->setView(view);
     m_countLabel->setText(QStringLiteral("下载 %1 首").arg(view.size()));
-}
-
-// 从索引文件里剔除某条路径（favorites / downloads 通用：数组名 = 文件名）
-static void pruneIndexFile(const QString& appName, const QString& path)
-{
-    QSettings ini(QSettings::IniFormat, QSettings::UserScope,
-                  QStringLiteral("PetPal"), appName);
-    const int n = ini.beginReadArray(appName);
-
-    struct Entry
-    {
-        QString title, artist, path;
-    };
-    QVector<Entry> kept;
-    for (int i = 0; i < n; ++i)
-    {
-        ini.setArrayIndex(i);
-        const QString p = ini.value(QStringLiteral("path")).toString();
-        if (p == path)
-            continue;
-        kept.append({ ini.value(QStringLiteral("title")).toString(),
-                      ini.value(QStringLiteral("artist")).toString(), p });
-    }
-    ini.endArray();
-
-    ini.beginWriteArray(appName, kept.size());
-    for (int i = 0; i < kept.size(); ++i)
-    {
-        ini.setArrayIndex(i);
-        ini.setValue(QStringLiteral("title"), kept.at(i).title);
-        ini.setValue(QStringLiteral("artist"), kept.at(i).artist);
-        ini.setValue(QStringLiteral("path"), kept.at(i).path);
-    }
-    ini.endArray();
 }
 
 void PlayerPage::removeDownloaded(int libIndex)
@@ -3355,8 +3532,7 @@ void PlayerPage::removeDownloaded(int libIndex)
     QFile::remove(QFileInfo(path).absolutePath() + QLatin1Char('/')
                   + QFileInfo(path).completeBaseName() + QStringLiteral(".lrc"));
 
-    // 剔索引（下载 + 收藏里同路径的条目）
-    pruneIndexFile(QStringLiteral("downloads"), path);
+    // 收藏索引里同路径的条目剔除（下载不再存索引，无需剔）
     pruneIndexFile(QStringLiteral("favorites"), path);
 
     // 出曲库（后面的下标整体前移，正在播的下标也要修）

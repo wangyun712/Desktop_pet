@@ -67,6 +67,7 @@
 //  会生成下面这些文件（都在 exe 同目录）：
 //    petpal_selftest.txt          —— 这份 exe 的编译时间 + 全部图片的加载情况
 //                                    + 每个状态的帧序列 + 系统托盘状态与隐藏/恢复往返测试
+//                                    + 任务栏最小化/复原往返测试
 //                                    + 好感度的点数/等级/今日额度/存档路径
 //    petpal_selftest_preview.png  —— 待机状态离屏渲染出来的实际画面
 //    petpal_selftest_drag.png     —— 拖拽状态离屏渲染出来的实际画面
@@ -591,6 +592,11 @@ static int runSelfTest()
                 ts << QStringLiteral("\r\n隐藏/恢复往返测试（走的就是菜单项和托盘图标调的那两条路径）:\r\n");
                 ts << pet.debugTrayRoundTrip();
 
+                // 任务栏图标（主面板的按钮）"点一下最小化、再点一下复原" ——
+                // 同样是截图上看不出来的功能，消息级往返的真实状态写进报告。
+                ts << QStringLiteral("\r\n--- 任务栏最小化/复原（主面板的任务栏图标）---\r\n");
+                ts << pet.debugMinimizeRoundTrip();
+
                 // 每日图片：图片在磁盘上（不在 .qrc 里），这一节说明"目录找没找到、
                 // 今天该显示哪张、会不会一天之内变来变去"。
                 ts << QStringLiteral("\r\n--- 每日图片（主面板那一页）---\r\n");
@@ -913,6 +919,10 @@ int main(int argc, char* argv[])
     // QApplication 必须先于任何 QWidget 构造
     QApplication app(argc, argv);
     QCoreApplication::setApplicationName(QStringLiteral("PetPal"));
+
+    // 应用图标（任务栏 / Alt-Tab / 窗口）：站立图裁出的洛天依头像。
+    // ★ 必须在建任何窗口之前设 ★ 之后创建的窗口都会继承它。
+    QApplication::setWindowIcon(DesktopPet::appAvatarIcon());
 
     // 读入用户上次在设置页调好的"界面字号"（首选项，存在 %APPDATA%/PetPal/ui.ini）。
     // 这里负责其中一半：把档位应用到全局默认字体；另一半在 UiFont::styleSheet() 里 ——

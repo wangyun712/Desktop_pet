@@ -96,6 +96,8 @@ set(PROJECT_SOURCES
     src/OnlineMusic.cpp
     src/MfDecode.h
     src/MfDecode.cpp
+    src/FlacEncode.h
+    src/FlacEncode.cpp
     # ★ miniaudio 4MB 的实现只在这一个文件里展开 ★
     #   拆出来是为了"改播放器逻辑不用重编 4MB"。详见该文件开头的说明。
     third_party/miniaudio_impl.cpp
@@ -112,6 +114,7 @@ set(PROJECT_RESOURCES
 add_executable(PetPal WIN32
     ${PROJECT_SOURCES}
     ${PROJECT_RESOURCES}
+    resources/app.rc              # exe 文件图标（引用同目录的 PetPal.ico）
 )
 
 # src 作为头文件搜索根目录，这样代码里就能写 #include "DesktopPet.h"
@@ -128,11 +131,54 @@ target_link_libraries(PetPal PRIVATE
     Qt6::Network
 )
 
-# Windows 自带的 Media Foundation：B 站音频（AAC/M4S）解码成 WAV 用。
+# Windows 自带的 Media Foundation：B 站音频（AAC/M4S）解码成 PCM 用。
 # miniaudio 只认 MP3/FLAC/WAV，AAC 这条只能靠系统组件转一手。
 if(WIN32)
     target_link_libraries(PetPal PRIVATE mfplat mfreadwrite mfuuid ole32)
 endif()
+
+# ---------------------------------------------------------------------------
+#  libFLAC（第三方，BSD 许可，third_party/libflac/LICENSE）
+#  把 Media Foundation 解出的 16bit PCM 编码成 FLAC（B 站转存用）。
+#  只编 C 库本体 17 个 .c：ogg 分轨与 x86 intrinsics 优化文件不参与
+#  （纯 C 路径，压缩级别 5 也远快于实时，编译最稳）。
+#  FLAC__NO_DLL = 静态链接（export.h 靠它关闭 dllexport）；
+#  PACKAGE_VERSION = 源码从 git 标签拷出，没有 config.h，版本串手动给。
+# ---------------------------------------------------------------------------
+set(FLAC_SOURCES
+    third_party/libflac/src/libFLAC/bitmath.c
+    third_party/libflac/src/libFLAC/bitreader.c
+    third_party/libflac/src/libFLAC/bitwriter.c
+    third_party/libflac/src/libFLAC/cpu.c
+    third_party/libflac/src/libFLAC/crc.c
+    third_party/libflac/src/libFLAC/fixed.c
+    third_party/libflac/src/libFLAC/float.c
+    third_party/libflac/src/libFLAC/format.c
+    third_party/libflac/src/libFLAC/lpc.c
+    third_party/libflac/src/libFLAC/md5.c
+    third_party/libflac/src/libFLAC/memory.c
+    third_party/libflac/src/libFLAC/metadata_iterators.c
+    third_party/libflac/src/libFLAC/metadata_object.c
+    third_party/libflac/src/libFLAC/stream_decoder.c
+    third_party/libflac/src/libFLAC/stream_encoder.c
+    third_party/libflac/src/libFLAC/stream_encoder_framing.c
+    third_party/libflac/src/libFLAC/window.c
+    # Windows 下 compat.h 把 fopen/fprintf 一律重定向到 UTF-8 版本，实现在这
+    third_party/libflac/src/share/win_utf8_io/win_utf8_io.c
+)
+add_library(flac STATIC ${FLAC_SOURCES})
+target_include_directories(flac
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libflac/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libflac/src/libFLAC/include
+)
+# FLAC__NO_DLL 必须 PUBLIC：使用方(FlacEncode.cpp)的 export.h 也要按静态库展开，
+# 不然按 dllimport 生成 __imp_ 前缀符号，链接就断了。
+target_compile_definitions(flac PUBLIC FLAC__NO_DLL)
+target_compile_definitions(flac PRIVATE FLAC__HAS_OGG=0 PACKAGE_VERSION=\"1.5.0\")
+if(MSVC)
+    target_compile_options(flac PRIVATE /utf-8 /w)
+endif()
+target_link_libraries(PetPal PRIVATE flac)
 
 # ---------------------------------------------------------------------------
 #  ★ 头文件依赖（第二道保险）—— 这段别删 ★
@@ -191,6 +237,7 @@ set(PETPAL_HEADERS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/DesktopLyrics.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/OnlineMusic.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/MfDecode.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/FlacEncode.h"
 )
 
 set_property(SOURCE
@@ -215,6 +262,7 @@ set_property(SOURCE
     src/DesktopLyrics.cpp
     src/OnlineMusic.cpp
     src/MfDecode.cpp
+    src/FlacEncode.cpp
     APPEND PROPERTY OBJECT_DEPENDS ${PETPAL_HEADERS}
 )
 

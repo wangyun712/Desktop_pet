@@ -13,6 +13,7 @@
 
 #include <QApplication>
 #include <QGuiApplication>
+#include <QEventLoop>
 #include <QScreen>
 #include <QTimer>
 #include <QPainter>
@@ -78,6 +79,10 @@ DesktopPet::DesktopPet(QWidget* parent) : QWidget(parent)
 
     buildMenu();
     setupTray();   // 建好托盘图标和菜单，但先不显示 —— 藏进状态栏那一刻才亮出来
+
+    // 窗口图标（Alt-Tab / 任务栏预览）：站立图裁出的头像。任务栏上的主图标
+    // 由 main() 里的 QApplication::setWindowIcon 全局设置（同一个头像）。
+    setWindowIcon(appAvatarIcon());
 
     // ---- 好感度 ----
     // 它是一个独立的数据对象（不带界面），到处都要用：点击、拖动、右键菜单、面板。
@@ -354,6 +359,35 @@ void DesktopPet::start()
         if (!line.isEmpty())
             m_bubble->say(line);
     });
+}
+
+// =============================================================================
+//  应用头像图标：站立图(08)裁出脸部区域，按任务栏/Alt-Tab 需要的多尺寸生成。
+//  与聊天头像（ChatPage::makeAvatar）同一个裁切框 —— 看起来才是"同一只"。
+// =============================================================================
+QIcon DesktopPet::appAvatarIcon()
+{
+    const QPixmap src(petImagePath(PetCfg::TRAY_ICON_IMG));
+    if (src.isNull())
+        return QIcon();
+
+    const QRect face(PetCfg::AVATAR_FACE_X, PetCfg::AVATAR_FACE_Y,
+                     PetCfg::AVATAR_FACE_S, PetCfg::AVATAR_FACE_S);
+
+    QIcon icon;
+    const int sizes[] = { 16, 24, 32, 48, 64, 128, 256 };
+    for (const int s : sizes)
+    {
+        QPixmap out(s, s);
+        out.fill(Qt::transparent);
+        QPainter p(&out);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+        p.drawPixmap(QRect(0, 0, s, s), src, face);
+        p.end();
+        icon.addPixmap(out);
+    }
+    return icon;
 }
 
 // =============================================================================
@@ -1806,6 +1840,68 @@ QString DesktopPet::debugTrayRoundTrip()
     return s;
 }
 
+// -----------------------------------------------------------------------------
+//  任务栏最小化 -> 复原 往返测试（--selftest 用）
+//
+//  "Shell 点任务栏图标"没法自动模拟，但那一下本质上就是对面板投递
+//  WM_SYSCOMMAND(SC_MINIMIZE / SC_RESTORE) —— 前提是面板带 WS_MINIMIZEBOX。
+//  这里就按系统会发的方式真实投递这两条消息，验证无边框面板的原生切换真的生效。
+//  ★ 只管面板自己 ★ 桌宠是独立窗口，不参与这条链。
+// -----------------------------------------------------------------------------
+QString DesktopPet::debugMinimizeRoundTrip()
+{
+    openPanel(/*showPanel=*/false);            // 面板是惰性建的，先建出来
+    if (!m_panel)
+        return QStringLiteral("  [跳过] 主面板创建失败\r\n");
+
+#ifdef Q_OS_WIN
+    const auto yn = [](bool b) { return b ? QStringLiteral("是") : QStringLiteral("否"); };
+    const auto pump = [](int ms) {
+        QElapsedTimer t;
+        t.start();
+        while (t.elapsed() < ms)
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    };
+
+    QString s;
+    const HWND hwnd = reinterpret_cast<HWND>(m_panel->winId());
+
+    m_panel->move(-32000, -32000);             // 屏幕外显示，用户看不见
+    m_panel->show();
+    pump(150);
+
+    // WS_MINIMIZEBOX 是整个功能的开关：Shell 只对带这一位的窗口发最小化/复原命令。
+    // 它是构造时手动补的，Qt 之后若重建原生窗口（改 flags 等）会把非自己管理的位抹掉
+    // —— 这里在真实 show() 之后读一次系统值，抹掉当场现形。
+    const bool box = (::GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_MINIMIZEBOX) != 0;
+    s += QStringLiteral("  WS_MINIMIZEBOX 在位=%1（Shell 发不发最小化命令全看这一位）\r\n")
+             .arg(yn(box));
+
+    s += QStringLiteral("  最小化前        : 面板最小化=%1\r\n")
+             .arg(yn(IsIconic(hwnd) != 0));
+
+    // ↓↓↓ Shell 点任务栏图标发的就是这两条消息，这里按原样投递 ↓↓↓
+    ::PostMessageW(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+    pump(300);
+    const bool minOk = IsIconic(hwnd) != 0;
+    s += QStringLiteral("  SC_MINIMIZE 后  : 面板最小化=%1\r\n").arg(yn(minOk));
+
+    ::PostMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
+    pump(300);
+    const bool restoredOk = !IsIconic(hwnd);
+    s += QStringLiteral("  SC_RESTORE 后   : 面板最小化=%1\r\n").arg(yn(IsIconic(hwnd) != 0));
+
+    m_panel->hide();                           // 测完把面板收回去（openPanel(false) 的原状）
+
+    const bool ok = box && minOk && restoredOk;
+    s += ok ? QStringLiteral("  [OK] 面板的任务栏最小化/复原（原生切换）正常\r\n")
+            : QStringLiteral("  [!!] 原生切换断了 —— 检查 MainPanel 构造里补的 WS_MINIMIZEBOX\r\n");
+    return s;
+#else
+    return QStringLiteral("  [跳过] 仅 Windows 有任务栏最小化链路\r\n");
+#endif
+}
+
 // =============================================================================
 //  主面板
 //
@@ -1820,6 +1916,8 @@ void DesktopPet::openPanel(bool showPanel)
     if (!m_panel)
     {
         // 第一次点开才建。之后一直留着（关闭只是 hide），所以再点开是秒开、状态不丢。
+        // ★ 面板和桌宠是两个独立窗口：任务栏图标（面板的按钮）只管面板自己的
+        //   最小化/复原，不牵动桌宠（用户明确要求，2026-09-28）★
         m_panel = new MainPanel(nullptr);        // 顶层窗口，没有 parent，析构时手动 delete
 
         // ---- 好感度页 ----

@@ -346,7 +346,7 @@ QPixmap ChatPage::makeAvatar(int size)
     if (src.isNull() || size <= 0)
         return QPixmap();
 
-    const QRect face(38, 81, 90, 90);
+    const QRect face(PetCfg::AVATAR_FACE_X, PetCfg::AVATAR_FACE_Y, PetCfg::AVATAR_FACE_S, PetCfg::AVATAR_FACE_S);
 
     QPixmap out(size, size);
     out.fill(Qt::transparent);

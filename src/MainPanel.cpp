@@ -18,6 +18,10 @@
 #include <QGuiApplication>
 #include <QWindow>          // startSystemMove()（见 mousePressEvent 的说明）
 
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
+
 // =============================================================================
 //  构造：搭出"顶部条 + (左侧导航 | 右侧内容)"
 // =============================================================================
@@ -48,9 +52,26 @@ MainPanel::MainPanel(QWidget* parent) : QWidget(parent)
     //   ★ 去掉之后仍要能"叫到前面来" ★ —— 由 showCenteredIn() 里的 raise() +
     //     activateWindow() 负责（从托盘/右键菜单打开面板时走那条路），
     //     所以是"用户一叫就上来、不叫就安分待着"，而不是"打开后永远压着别人"。
-    setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
+    setWindowFlags(Qt::Window | Qt::FramelessWindowHint
+                 | Qt::WindowMinimizeButtonHint);   // 声明"支持最小化"（真正的开关在下面补的原生位）
     setAttribute(Qt::WA_TranslucentBackground);   // 圆角之外的地方要透出桌面
     setWindowTitle(QStringLiteral("PetPal 面板"));
+
+#ifdef Q_OS_WIN
+    // ★ 无边框窗口要自己补 WS_MINIMIZEBOX，任务栏的"点一下最小化 / 再点一下复原"才生效 ★
+    //   无边框窗口在系统里是 WS_POPUP，没有 WS_MINIMIZEBOX 这一位时，Shell 对任务栏
+    //   图标的点击只会"激活窗口"，不发 SC_MINIMIZE/SC_RESTORE —— 用户点第二下什么
+    //   都不会发生。这里在 winId() 建好原生窗口之后把这一位 OR 上去，之后系统按
+    //   标准窗口行为原生完成切换：任务栏图标只管面板自己（最小化/复原面板），
+    //   桌宠是另一个独立窗口，不受它影响（用户明确要求，2026-09-28）。
+    //   只补 MINIMIZEBOX 不补 CAPTION，系统不会因此画出标题栏，面板还是无边框的样子。
+    {
+        const HWND hwnd = reinterpret_cast<HWND>(winId());
+        if (hwnd)
+            ::SetWindowLongPtrW(hwnd, GWL_STYLE,
+                                ::GetWindowLongPtrW(hwnd, GWL_STYLE) | WS_MINIMIZEBOX);
+    }
+#endif
     // 尺寸是给「每日图片」页留的：这一页要放一张插画，340 高的时候图片区只剩
     // 240px 左右，看着就是个缩略图。加高到 440 之后可用区域约 490x350。
     // 其它页都有 addStretch，跟着变高只是更透气，不会被拉变形。

@@ -2,9 +2,13 @@
 
 #ifdef Q_OS_WIN
 
-#include <QFile>
-#include <QFileInfo>
+#include "FlacEncode.h"
 
+#include <QFile>
+#include <QMetaObject>
+#include <QPointer>
+
+#include <objbase.h>
 #include <windows.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -16,6 +20,7 @@
 #pragma comment(lib, "ole32.lib")
 
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -32,23 +37,16 @@ struct MfPtr
     explicit operator bool() const { return p != nullptr; }
 };
 
-void putU32(QFile& f, quint32 v)
+struct DecodedPcm
 {
-    unsigned char b[4] = { quint8(v), quint8(v >> 8), quint8(v >> 16), quint8(v >> 24) };
-    f.write(reinterpret_cast<const char*>(b), 4);
-}
+    QByteArray pcm;
+    UINT32 channels   = 2;
+    UINT32 sampleRate = 48000;
+};
 
-void putU16(QFile& f, quint16 v)
-{
-    unsigned char b[2] = { quint8(v), quint8(v >> 8) };
-    f.write(reinterpret_cast<const char*>(b), 2);
-}
-
-} // namespace
-
-namespace MfDecode {
-
-bool decodeToWav(const QString& input, const QString& outputWav, QString* errorOut)
+// 解码内核：AAC/M4S → 16bit 交错小端 PCM（声道数/采样率随源走）。
+// 只做解码，写文件交给 FlacEncode —— 职责分开，各自都能单测。
+bool decodePcm(const QString& input, DecodedPcm& out, QString* errorOut)
 {
     auto fail = [errorOut](const QString& msg) {
         if (errorOut)
@@ -76,9 +74,8 @@ bool decodeToWav(const QString& input, const QString& outputWav, QString* errorO
     // 探一下源格式（声道数 / 采样率随源走，位深固定 16）
     MfPtr<IMFMediaType> native;
     reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &native);
-    UINT32 channels = 2, sampleRate = 48000;
-    native->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &channels);
-    native->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &sampleRate);
+    native->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &out.channels);
+    native->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &out.sampleRate);
 
     // 输出类型：16bit PCM
     MfPtr<IMFMediaType> target;
@@ -86,8 +83,8 @@ bool decodeToWav(const QString& input, const QString& outputWav, QString* errorO
     target->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
     target->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
     target->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
-    target->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, channels);
-    target->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, sampleRate);
+    target->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, out.channels);
+    target->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, out.sampleRate);
     hr = reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, target.get());
     if (FAILED(hr))
     {
@@ -96,7 +93,6 @@ bool decodeToWav(const QString& input, const QString& outputWav, QString* errorO
     }
 
     // 解码循环：全部读到内存（一首歌 4 分钟 ≈ 40MB，量级可接受）
-    QByteArray pcm;
     for (;;)
     {
         DWORD flags = 0;
@@ -121,40 +117,63 @@ bool decodeToWav(const QString& input, const QString& outputWav, QString* errorO
         DWORD len = 0;
         if (SUCCEEDED(buf->Lock(&data, nullptr, &len)) && data)
         {
-            pcm.append(reinterpret_cast<const char*>(data), int(len));
+            out.pcm.append(reinterpret_cast<const char*>(data), int(len));
             buf->Unlock();
         }
     }
 
     MFShutdown();
 
-    if (pcm.isEmpty())
+    if (out.pcm.isEmpty())
         return fail(QStringLiteral("没有解出音频数据"));
-
-    // ---- 包 WAV 头（16bit PCM，小端）----
-    QFile out(outputWav);
-    if (!out.open(QIODevice::WriteOnly))
-        return fail(QStringLiteral("无法写出 WAV 文件"));
-
-    const quint32 dataLen  = quint32(pcm.size());
-    const quint32 byteRate = channels * sampleRate * 2;
-
-    out.write("RIFF", 4);
-    putU32(out, 36 + dataLen);
-    out.write("WAVE", 4);
-    out.write("fmt ", 4);
-    putU32(out, 16);              // fmt 块长
-    putU16(out, 1);               // PCM
-    putU16(out, quint16(channels));
-    putU32(out, sampleRate);
-    putU32(out, byteRate);
-    putU16(out, quint16(channels * 2));   // 块对齐
-    putU16(out, 16);              // 位深
-    out.write("data", 4);
-    putU32(out, dataLen);
-    out.write(pcm.constData(), pcm.size());
-    out.close();
     return true;
+}
+
+} // namespace
+
+namespace MfDecode {
+
+bool decodeToFlac(const QString& input, const QString& outputFlac,
+                  const QString& title, const QString& artist,
+                  QString* errorOut)
+{
+    QString err;
+    DecodedPcm d;
+    if (!decodePcm(input, d, &err))
+    {
+        if (errorOut)
+            *errorOut = err;
+        return false;
+    }
+    return FlacEncode::encode(d.pcm, int(d.channels), int(d.sampleRate),
+                              title, artist, outputFlac, errorOut);
+}
+
+void decodeToFlacAsync(QObject* ctx, const QString& input, const QString& outputFlac,
+                       const QString& title, const QString& artist,
+                       std::function<void(bool ok, const QString& err)> cb)
+{
+    // QPointer 跨线程判断宿主是否还活着：窗口都关了就没必要再回头调 UI
+    QPointer<QObject> guard(ctx);
+    std::thread([guard, input, outputFlac, title, artist,
+                 cb = std::move(cb)]() mutable {
+        // MF 要求所在线程先初始化 COM；主线程 Qt 已经按 STA 起过，
+        // 这里是新线程得自己来（MTA 即可）。RPC_E_CHANGED_MODE 说明
+        // 已被别处按 STA 初始化，同样能跑，只是不能配对 Uninitialize。
+        const HRESULT cohr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool needCoUninit = SUCCEEDED(cohr);
+
+        QString err;
+        const bool ok = decodeToFlac(input, outputFlac, title, artist, &err);
+
+        if (needCoUninit)
+            CoUninitialize();
+
+        if (guard)
+            QMetaObject::invokeMethod(guard.data(),
+                [ok, err, cb = std::move(cb)] { cb(ok, err); },
+                Qt::QueuedConnection);
+    }).detach();
 }
 
 } // namespace MfDecode
@@ -162,12 +181,23 @@ bool decodeToWav(const QString& input, const QString& outputWav, QString* errorO
 #else // 非 Windows：编译占位（本项目只发 Windows）
 
 namespace MfDecode {
-bool decodeToWav(const QString&, const QString&, QString* errorOut)
+
+bool decodeToFlac(const QString&, const QString&, const QString&, const QString&,
+                  QString* errorOut)
 {
     if (errorOut)
         *errorOut = QStringLiteral("仅 Windows 支持");
     return false;
 }
+
+void decodeToFlacAsync(QObject*, const QString&, const QString&,
+                       const QString&, const QString&,
+                       std::function<void(bool ok, const QString& err)> cb)
+{
+    if (cb)
+        cb(false, QStringLiteral("仅 Windows 支持"));
+}
+
 } // namespace MfDecode
 
 #endif

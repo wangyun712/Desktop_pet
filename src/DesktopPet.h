@@ -80,6 +80,10 @@ public:
     // 心形形状/颜色/淡出对不对，看图就知道。
     QPixmap debugGrabFx();
 
+    // 应用头像图标：站立图(08)裁出脸部，多尺寸生成（任务栏/Alt-Tab/窗口通用）。
+    // main() 在建任何窗口前把它设成全局图标；本窗口自己也设一份（Alt-Tab）。
+    static QIcon appAvatarIcon();
+
     // 托盘状态描述，给 --selftest 用。
     // 托盘是个"看不见的功能"——出问题时用户只会觉得"点了隐藏就再也叫不回来"，
     // 所以把可用性、图标有没有建起来、菜单项是否启用都写进自检报告，排错第一步就能看到。
@@ -107,6 +111,12 @@ public:
     // 时钟基准、心跳定时器、自动行为开关这三样只要漏一个，就会出现
     // "回来以后顿一下""回来不走路了""明明暂停了却自己动起来"这类怪现象。
     QString debugTrayRoundTrip();
+
+    // 【只给 --selftest 用】真实投递 SC_MINIMIZE / SC_RESTORE（Shell 点任务栏图标
+    // 发的就是这两条消息），验证面板补的 WS_MINIMIZEBOX 在 show() 之后仍然在位、
+    // 任务栏"点一下最小化、再点一下复原"的原生切换对无边框面板真的生效。
+    // ★ 只管面板自己 ★ 桌宠是独立窗口，不参与这条链（用户明确要求，2026-09-28）。
+    QString debugMinimizeRoundTrip();
 
     // 【只给 --selftest 用】读 Windows **实际**的 WS_EX_TOPMOST 位。
     //

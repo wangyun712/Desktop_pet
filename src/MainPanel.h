@@ -52,6 +52,11 @@ public:
     // 页面各自的字号由各自的 applyUiScale() 负责，这里只管导航和窗控按钮。
     void applyUiScale();
 
+    // ★ 面板和桌宠是两个独立窗口，任务栏图标只管面板自己 ★（用户明确要求，2026-09-28）
+    //   任务栏上的图标是本面板的按钮：点一下面板最小化到任务栏、再点一下复原 ——
+    //   这是标准窗口行为。无边框窗口系统默认不发这套切换命令，
+    //   构造函数里补了 WS_MINIMIZEBOX 之后由系统原生完成，这里不需要任何代码。
+
 protected:
     void paintEvent(QPaintEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;

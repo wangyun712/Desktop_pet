@@ -20,23 +20,26 @@ namespace OnlineMusic {
 namespace {
 
 // 桌面客户端常见 UA：两个平台都按"浏览器"对待，裸 UA 会被直接拒
+//伪造 HTTP 请求里的 User-Agent (UA) 请求头，伪装成 Windows 上的 Chrome 120 浏览器去访问网站接口
 const char* const kUA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+//Qt 框架里专门用来发送 HTTP/HTTPS 网络请求、接收网络响应的类，C++ Qt 桌面程序用它做网络通信
 QNetworkAccessManager& nam()
 {
     static QNetworkAccessManager m;
     return m;
 }
 
-QNetworkReply* get(const QUrl& url, const QMap<QString, QString>& headers = {})
+QNetworkReply* get(const QUrl& url, const QMap<QString, QString>& headers = {},
+                   int timeoutMs = 15000)
 {
     QNetworkRequest req(url);
-    // ★ 大文件的下载上限要放宽 ★ 一首 320k 的歌 ~10MB，12 秒总时长根本
-    // 下不完 —— 到点 abort 的表现就是"联网失败"。搜索/取直链这类小请求
-    // 用默认短超时没问题，下载单独放宽（调用方传什么就是什么）。
-    req.setTransferTimeout(120000);
+    // ★ 超时分两档 ★ 搜索/取直链是几 KB 的小请求，15 秒足够（挂太久会拖住
+    // "搜不到 → B 站接档"的回退链）；下载整首歌单独放宽到 120 秒。
+    // 到点 abort 的表现就是行上的"联网失败·超时"。
+    req.setTransferTimeout(timeoutMs);
     req.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                      QNetworkRequest::NoLessSafeRedirectPolicy);
     req.setRawHeader("User-Agent", kUA);
@@ -45,6 +48,7 @@ QNetworkReply* get(const QUrl& url, const QMap<QString, QString>& headers = {})
     return nam().get(req);
 }
 
+//封装一个简易工具函数，从 Qt 的 QJsonObject 里按 key 取出字符串类型的值，返回 QString
 QString jsonStr(const QJsonObject& o, const char* key)
 {
     return o.value(QLatin1String(key)).toString();
@@ -60,7 +64,11 @@ QString stripTags(const QString& s)
 // ---------------------------------------------------------------------------
 //  B 站会话：buvid3（本地造一个格式合法的）+ WBI 签名密钥（nav 接口，每天轮换）
 // ---------------------------------------------------------------------------
-QString buvid3()
+//1. 伪造 UA，告诉服务器：我是 Chrome 浏览器
+//2. `buvid3()` 生成固定字符串，放到 Cookie 头，模拟设备指纹标识
+//3. 实现 WBI 签名（w_rid），满足 B 站网页接口另一个强制校验
+//4. 用 QNetworkAccessManager 发送 HTTP 请求，带上 UA+Cookie (buvid3)+ 签名后的参数
+QString buvid3()//标记 “是谁的设备”，风控限流、识别同一客户端
 {
     static QString v;
     if (v.isEmpty())
@@ -77,6 +85,7 @@ QString buvid3()
 }
 
 // WBI 混淆表：imgKey+subKey 按这张表重排后取前 32 位就是签名密钥
+//WBI作用：保证【本次请求参数没被篡改、没有过期重放】
 const int kWbiTable[] = {
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
     33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
@@ -94,7 +103,7 @@ void ensureWbiKey(std::function<void(const QString&)> cb)
         return;
     }
 
-    auto* reply = get(QUrl(QStringLiteral("https://api.bilibili.com/x/web-interface/nav")));
+    auto* reply = get(QUrl(QStringLiteral("https://api.bilibili.com/x/web-interface/nav")), {}, 15000);
     QObject::connect(reply, &QNetworkReply::finished, reply, [reply, cb] {
         reply->deleteLater();
         const QJsonObject wbi = QJsonDocument::fromJson(reply->readAll())
@@ -159,14 +168,16 @@ QString wbiQuery(const QMap<QString, QString>& params, const QString& mixinKey)
 void searchNetEase(const QString& keyword, ItemListCb cb)
 {
     QUrl url(QStringLiteral("https://music.163.com/api/search/get/web"));
-    QUrlQuery q;
-    q.addQueryItem(QStringLiteral("s"), keyword);
-    q.addQueryItem(QStringLiteral("type"), QStringLiteral("1"));
-    q.addQueryItem(QStringLiteral("offset"), QStringLiteral("0"));
-    q.addQueryItem(QStringLiteral("limit"), QStringLiteral("20"));
-    url.setQuery(q);
+    //创建QUrl对象，目标是网易云音乐web版搜索API接口地址
+    QUrlQuery q;//构造URL的查询参数
+    q.addQueryItem(QStringLiteral("s"), keyword);//搜索关键词
+    q.addQueryItem(QStringLiteral("type"), QStringLiteral("1"));//歌曲代码
+    q.addQueryItem(QStringLiteral("offset"), QStringLiteral("0"));//分页偏移量
+    q.addQueryItem(QStringLiteral("limit"), QStringLiteral("20"));//数量限制
+    url.setQuery(q);//拼接搜索
+    // 例如：https://music.163.com/api/search/get/web?s=关键词&type=1&offset=0&limit=20
 
-    auto* reply = get(url, {{QStringLiteral("Referer"), QStringLiteral("https://music.163.com")}});
+    auto* reply = get(url, {{QStringLiteral("Referer"), QStringLiteral("https://music.163.com")}}, 15000);
     QObject::connect(reply, &QNetworkReply::finished, reply, [reply, cb] {
         reply->deleteLater();
         QVector<Item> out;
@@ -218,7 +229,7 @@ void netEaseUrl(const QString& songId, UrlCb cb)
     q.addQueryItem(QStringLiteral("br"), QStringLiteral("320000"));
     url.setQuery(q);
 
-    auto* reply = get(url, {{QStringLiteral("Referer"), QStringLiteral("https://music.163.com")}});
+    auto* reply = get(url, {{QStringLiteral("Referer"), QStringLiteral("https://music.163.com")}}, 15000);
     QObject::connect(reply, &QNetworkReply::finished, reply, [reply, cb] {
         reply->deleteLater();
         QString link, suffix = QStringLiteral("mp3");
@@ -248,7 +259,7 @@ void netEaseLyric(const QString& songId, TextCb cb)
     q.addQueryItem(QStringLiteral("tv"), QStringLiteral("-1"));
     url.setQuery(q);
 
-    auto* reply = get(url, {{QStringLiteral("Referer"), QStringLiteral("https://music.163.com")}});
+    auto* reply = get(url, {{QStringLiteral("Referer"), QStringLiteral("https://music.163.com")}}, 15000);
     QObject::connect(reply, &QNetworkReply::finished, reply, [reply, cb] {
         reply->deleteLater();
         cb(QJsonDocument::fromJson(reply->readAll())
@@ -282,12 +293,12 @@ void searchBilibili(const QString& keyword, ItemListCb cb)
         auto* reply = get(url, {
             {QStringLiteral("Referer"), QStringLiteral("https://www.bilibili.com")},
             {QStringLiteral("Cookie"), QStringLiteral("buvid3=") + buvid3()},
-        });
+        }, 15000);
         QObject::connect(reply, &QNetworkReply::finished, reply, [reply, cb] {
             reply->deleteLater();
             QVector<Item> out;
             // result 是"分组"数组：每组 result_type 一类，具体条目在组内 data 里。
-            // 按综合顺序遍历分组，只收视频条目，凑满 10 个为止。
+            // 按综合顺序遍历分组，只收视频条目，凑满 20 个为止。
             const QJsonArray groups = QJsonDocument::fromJson(reply->readAll())
                                           .object()
                                           .value(QLatin1String("data")).toObject()
@@ -319,10 +330,10 @@ void searchBilibili(const QString& keyword, ItemListCb cb)
                     if (it.id.isEmpty() || it.title.isEmpty())
                         continue;
                     out.append(it);
-                    if (out.size() >= 10)
+                    if (out.size() >= 20)
                         break;
                 }
-                if (out.size() >= 10)
+                if (out.size() >= 20)
                     break;
             }
             cb(out);
