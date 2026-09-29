@@ -11,6 +11,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QPointer>
 #include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QUrlQuery>
@@ -93,7 +94,22 @@ const int kWbiTable[] = {
     11, 36, 20, 34, 44, 52
 };
 
-void ensureWbiKey(std::function<void(const QString&)> cb)
+// ★ 异步回调的"宿主还在吗"守卫 ★（下面每个网络回调的第一件事就是问它一句）
+//
+//  为什么非要有它：nam() 是文件末尾那个**进程级 static 单例**，reply 是挂在它
+//  名下的孩子 —— 所以 reply 的生命周期比任何一个界面都长。而 connect 又必须
+//  挂在 reply 上（挂到别的对象上就没人回收这个 reply 了）。
+//  两条一凑就有个空档：面板先析构、HTTP 转完才回来 —— 那一刻 lambda 里调的
+//  cb 捕获的 this 已经是野指针，直接崩在信号投递里。
+//
+//  用法：ctx 传调用方自己（PlayerPage 传 this），回调体开头问一句；
+//  ctx 传 nullptr 表示调用方不要守卫（自检之类的场景），一律放行。
+inline bool hostAlive(QObject* ctx, const QPointer<QObject>& guard)
+{
+    return ctx == nullptr || !guard.isNull();
+}
+
+void ensureWbiKey(std::function<void(const QString&)> cb, QObject* ctx)
 {
     static QString cached;
     static QElapsedTimer timer;
@@ -104,8 +120,11 @@ void ensureWbiKey(std::function<void(const QString&)> cb)
     }
 
     auto* reply = get(QUrl(QStringLiteral("https://api.bilibili.com/x/web-interface/nav")), {}, 15000);
-    QObject::connect(reply, &QNetworkReply::finished, reply, [reply, cb] {
+    QObject::connect(reply, &QNetworkReply::finished, reply,
+                     [reply, cb, ctx, guard = QPointer<QObject>(ctx)] {
         reply->deleteLater();
+        if (!hostAlive(ctx, guard))
+            return;                        // 宿主没了：结果丢弃（reply 上面已经排好回收）
         const QJsonObject wbi = QJsonDocument::fromJson(reply->readAll())
                                     .object()
                                     .value(QLatin1String("data")).toObject()
@@ -165,7 +184,7 @@ QString wbiQuery(const QMap<QString, QString>& params, const QString& mixinKey)
 // =============================================================================
 //  网易云
 // =============================================================================
-void searchNetEase(const QString& keyword, ItemListCb cb)
+void searchNetEase(const QString& keyword, ItemListCb cb, QObject* ctx)
 {
     QUrl url(QStringLiteral("https://music.163.com/api/search/get/web"));
     //创建QUrl对象，目标是网易云音乐web版搜索API接口地址
@@ -178,8 +197,11 @@ void searchNetEase(const QString& keyword, ItemListCb cb)
     // 例如：https://music.163.com/api/search/get/web?s=关键词&type=1&offset=0&limit=20
 
     auto* reply = get(url, {{QStringLiteral("Referer"), QStringLiteral("https://music.163.com")}}, 15000);
-    QObject::connect(reply, &QNetworkReply::finished, reply, [reply, cb] {
+    QObject::connect(reply, &QNetworkReply::finished, reply,
+                     [reply, cb, ctx, guard = QPointer<QObject>(ctx)] {
         reply->deleteLater();
+        if (!hostAlive(ctx, guard))
+            return;                        // 宿主没了：结果丢弃（reply 上面已经排好回收）
         QVector<Item> out;
         const QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
         const QJsonArray songs = doc.object()
@@ -221,7 +243,7 @@ void searchNetEase(const QString& keyword, ItemListCb cb)
     });
 }
 
-void netEaseUrl(const QString& songId, UrlCb cb)
+void netEaseUrl(const QString& songId, UrlCb cb, QObject* ctx)
 {
     QUrl url(QStringLiteral("https://music.163.com/api/song/enhance/player/url"));
     QUrlQuery q;
@@ -230,8 +252,11 @@ void netEaseUrl(const QString& songId, UrlCb cb)
     url.setQuery(q);
 
     auto* reply = get(url, {{QStringLiteral("Referer"), QStringLiteral("https://music.163.com")}}, 15000);
-    QObject::connect(reply, &QNetworkReply::finished, reply, [reply, cb] {
+    QObject::connect(reply, &QNetworkReply::finished, reply,
+                     [reply, cb, ctx, guard = QPointer<QObject>(ctx)] {
         reply->deleteLater();
+        if (!hostAlive(ctx, guard))
+            return;                        // 宿主没了：结果丢弃
         QString link, suffix = QStringLiteral("mp3");
         const QJsonArray data = QJsonDocument::fromJson(reply->readAll())
                                     .object()
@@ -244,12 +269,11 @@ void netEaseUrl(const QString& songId, UrlCb cb)
             if (suffix.isEmpty())
                 suffix = QStringLiteral("mp3");
         }
-        // link 为空 = VIP/无版权：调用方转 B 站
         cb(link, suffix);
     });
 }
 
-void netEaseLyric(const QString& songId, TextCb cb)
+void netEaseLyric(const QString& songId, TextCb cb, QObject* ctx)
 {
     QUrl url(QStringLiteral("https://music.163.com/api/song/lyric"));
     QUrlQuery q;
@@ -260,8 +284,11 @@ void netEaseLyric(const QString& songId, TextCb cb)
     url.setQuery(q);
 
     auto* reply = get(url, {{QStringLiteral("Referer"), QStringLiteral("https://music.163.com")}}, 15000);
-    QObject::connect(reply, &QNetworkReply::finished, reply, [reply, cb] {
+    QObject::connect(reply, &QNetworkReply::finished, reply,
+                     [reply, cb, ctx, guard = QPointer<QObject>(ctx)] {//【捕获列表】：把外面变量抓进这个匿名函数里
         reply->deleteLater();
+        if (!hostAlive(ctx, guard))
+            return;                        // 宿主没了：结果丢弃
         cb(QJsonDocument::fromJson(reply->readAll())
                .object()
                .value(QLatin1String("lrc")).toObject()
@@ -272,9 +299,9 @@ void netEaseLyric(const QString& songId, TextCb cb)
 // =============================================================================
 //  B 站
 // =============================================================================
-void searchBilibili(const QString& keyword, ItemListCb cb)
+void searchBilibili(const QString& keyword, ItemListCb cb, QObject* ctx)
 {
-    ensureWbiKey([cb, keyword](const QString& mixin) {
+    ensureWbiKey([cb, keyword, ctx](const QString& mixin) {
         if (mixin.isEmpty())
         {
             cb({});                        // 拿不到 WBI 密钥：B 站搜索放弃
@@ -294,8 +321,11 @@ void searchBilibili(const QString& keyword, ItemListCb cb)
             {QStringLiteral("Referer"), QStringLiteral("https://www.bilibili.com")},
             {QStringLiteral("Cookie"), QStringLiteral("buvid3=") + buvid3()},
         }, 15000);
-        QObject::connect(reply, &QNetworkReply::finished, reply, [reply, cb] {
+        QObject::connect(reply, &QNetworkReply::finished, reply,
+                         [reply, cb, ctx, guard = QPointer<QObject>(ctx)] {
             reply->deleteLater();
+            if (!hostAlive(ctx, guard))
+                return;                    // 宿主没了：结果丢弃
             QVector<Item> out;
             // result 是"分组"数组：每组 result_type 一类，具体条目在组内 data 里。
             // 按综合顺序遍历分组，只收视频条目，凑满 20 个为止。
@@ -338,16 +368,19 @@ void searchBilibili(const QString& keyword, ItemListCb cb)
             }
             cb(out);
         });
-    });
+    }, ctx);
 }
 
-void bilibiliAudio(const QString& bvid, UrlCb cb)
+void bilibiliAudio(const QString& bvid, UrlCb cb, QObject* ctx)
 {
     // ① bvid → cid（一个视频一条 cid）
     const QUrl view(QStringLiteral("https://api.bilibili.com/x/web-interface/view?bvid=") + bvid);
     auto* r1 = get(view, {{QStringLiteral("Referer"), QStringLiteral("https://www.bilibili.com")}});
-    QObject::connect(r1, &QNetworkReply::finished, r1, [r1, cb, bvid] {
+    QObject::connect(r1, &QNetworkReply::finished, r1,
+                     [r1, cb, ctx, bvid, guard = QPointer<QObject>(ctx)] {
         r1->deleteLater();
+        if (!hostAlive(ctx, guard))
+            return;                        // 宿主没了：结果丢弃
         const qint64 cid = QJsonDocument::fromJson(r1->readAll())
                                .object()
                                .value(QLatin1String("data")).toObject()
@@ -368,8 +401,11 @@ void bilibiliAudio(const QString& bvid, UrlCb cb)
         play.setQuery(q);
 
         auto* r2 = get(play, {{QStringLiteral("Referer"), QStringLiteral("https://www.bilibili.com")}});
-        QObject::connect(r2, &QNetworkReply::finished, r2, [r2, cb] {
+        QObject::connect(r2, &QNetworkReply::finished, r2,
+                         [r2, cb, ctx, guard = QPointer<QObject>(ctx)] {
             r2->deleteLater();
+            if (!hostAlive(ctx, guard))
+                return;                    // 宿主没了：结果丢弃
             const QJsonArray audio = QJsonDocument::fromJson(r2->readAll())
                                          .object()
                                          .value(QLatin1String("data")).toObject()
@@ -398,7 +434,7 @@ void bilibiliAudio(const QString& bvid, UrlCb cb)
 // =============================================================================
 void download(const QString& url, const QString& savePath,
               const QMap<QString, QString>& headers,
-              ProgressCb progress, DoneCb done)
+              ProgressCb progress, DoneCb done, QObject* ctx)
 {
     if (url.isEmpty())
     {
@@ -411,10 +447,17 @@ void download(const QString& url, const QString& savePath,
     if (progress)
     {
         QObject::connect(reply, &QNetworkReply::downloadProgress, reply,
-                         [progress](qint64 got, qint64 total) { progress(got, total); });
+                         [progress, ctx, guard = QPointer<QObject>(ctx)](qint64 got, qint64 total) {
+                             if (!hostAlive(ctx, guard))
+                                 return;
+                             progress(got, total);
+                         });
     }
-    QObject::connect(reply, &QNetworkReply::finished, reply, [reply, savePath, done] {
+    QObject::connect(reply, &QNetworkReply::finished, reply,
+                     [reply, savePath, done, ctx, guard = QPointer<QObject>(ctx)] {
         reply->deleteLater();
+        if (!hostAlive(ctx, guard))
+            return;                        // 宿主没了：结果丢弃（reply 上面已经排好回收）
         if (reply->error() != QNetworkReply::NoError)
         {
             if (done)

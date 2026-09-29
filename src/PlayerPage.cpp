@@ -2863,7 +2863,7 @@ void PlayerPage::doOnlineSearch(const QString& keyword)
                     rows.append(toOnlineRow(it));
         dropAlreadyStreaming(rows, m_lib);
                 m_model->setOnlineResults(rows);
-            });
+            }, this);
         return;
     }
 
@@ -2881,7 +2881,7 @@ void PlayerPage::doOnlineSearch(const QString& keyword)
             rows.append(toOnlineRow(it));
         dropAlreadyStreaming(rows, m_lib);
         m_model->setOnlineResults(rows);
-    });
+    }, this);
 }
 
 // 网易搜不到 / 收费时的回退：B 站搜同关键词，结果替换联网区；
@@ -2898,7 +2898,7 @@ void PlayerPage::fallbackBilibili(const QString& keyword, const QString& dir,
 
         if (!rows.isEmpty() && play)
             fetchAndPlay(m_model->localRowCount(), rows.first(), dir, registerFav, play);
-    });
+    }, this);
 }
 
 void PlayerPage::playOnlineRow(int row)
@@ -2983,12 +2983,12 @@ void PlayerPage::fetchAndPlay(int row, const TrackListModel::OnlineTrack& it,
                                 }
                             }
                             finishOnlineTrack(it, savePath, dir, registerFav, play, refreshList);
-                        });
+                        }, this);
                     return;
                 }
 
                 finishOnlineTrack(it, savePath, dir, registerFav, play, refreshList);
-            });
+            }, this);
     };
 
     if (it.source == OnlineMusic::NetEase)
@@ -3027,13 +3027,13 @@ void PlayerPage::fetchAndPlay(int row, const TrackListModel::OnlineTrack& it,
                             if (lrc.isEmpty() || m_model->playingOnlineId() != id)
                                 return;          // 已经切歌：过期回调丢弃
                             rebuildLyricLabels(TrackMeta::parseLrc(lrc));
-                        });
+                        }, this);
                     return;
                 }
 
                 // 收藏 / 仅下载：完整下载到储存盘（进"我的下载"）
                 startDl(url, suffix);
-            });
+            }, this);
     }
     else
     {
@@ -3096,8 +3096,8 @@ void PlayerPage::fetchAndPlay(int row, const TrackListModel::OnlineTrack& it,
                                 QFile::remove(m4aPath);            // 中间产物不留
                                 playLocalWav(it, flacPath, registerFav, play);
                             });
-                    });
-            });
+                    }, this);
+            }, this);
     }
 }
 

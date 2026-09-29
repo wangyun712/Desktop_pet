@@ -72,10 +72,24 @@ bool decodePcm(const QString& input, DecodedPcm& out, QString* errorOut)
     reader->SetStreamSelection(MF_SOURCE_READER_FIRST_AUDIO_STREAM, TRUE);
 
     // 探一下源格式（声道数 / 采样率随源走，位深固定 16）
+    // ★ 这一步必须判失败 ★ 没有音频轨的 m4a/m4s、或者容器认得出但流取不到时，
+    //   GetNativeMediaType 会返回失败并把 native 留成空指针 —— 不判就
+    //   native->GetUINT32() 是空指针调虚函数，直接崩。宁可在这里报错，
+    //   让调用方把"该资源无法播放"显示到列表行上。
     MfPtr<IMFMediaType> native;
-    reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &native);
+    hr = reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &native);
+    if (FAILED(hr) || !native)
+    {
+        MFShutdown();
+        return fail(QStringLiteral("读不到音频流格式（这条资源可能没有音频轨）"));
+    }
     native->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &out.channels);
     native->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &out.sampleRate);
+    if (out.channels == 0 || out.sampleRate == 0)
+    {
+        MFShutdown();
+        return fail(QStringLiteral("音频流格式不可用（声道数 / 采样率为 0）"));
+    }
 
     // 输出类型：16bit PCM
     MfPtr<IMFMediaType> target;

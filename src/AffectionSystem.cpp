@@ -6,8 +6,8 @@
 // =============================================================================
 //  构造
 // =============================================================================
-AffectionSystem::AffectionSystem(bool persistent, QObject* parent)
-    : QObject(parent), m_persistent(persistent)
+AffectionSystem::AffectionSystem(bool persistent, QObject* parent, const QString& settingsOrg)
+    : QObject(parent), m_persistent(persistent), m_settingsOrg(settingsOrg)
 {
     m_clock.start();
     m_day = QDate::currentDate();
@@ -328,21 +328,34 @@ void AffectionSystem::onTimer()
 QString AffectionSystem::savePath() const
 {
     const QSettings s(QSettings::IniFormat, QSettings::UserScope,
-                      QStringLiteral("PetPal"), QStringLiteral("affection"));
+                      m_settingsOrg, QStringLiteral("affection"));
     return s.fileName();
 }
 
+// ★ 加"每日额度"类字段时，save() 和 load() 必须同时加，少一边就白加 ★
+//
+//   2026-09-29 修过一次真实事故：m_chatUsed 加进了 resetAll()/dailyReset()，
+//   却没进存档 —— 于是"当天关掉程序再打开"，聊天加分额度直接回满 5 次，
+//   每天实际上限 15 分变成可以反复重开刷。面板上的"今日还剩几次"也跟着撒谎。
+//   自检当时抓不到：--affectiontrace 用的是 persistent=false，根本不碰存档。
+//
+//   所以这里三个 *Used 挨着写、一字排开，加字段时照着这一片抄：
+//     petUsed / feedUsed / chatUsed —— 缺任何一个，重开程序都能绕过那个额度。
+//   m_companyAccMs 同理：它是"陪伴累计到下一次 +1 的余数"，不存就等于每次
+//   启动白扔一个周期的进度。
 void AffectionSystem::save() const
 {
     if (!m_persistent)
         return;
 
     QSettings s(QSettings::IniFormat, QSettings::UserScope,
-                QStringLiteral("PetPal"), QStringLiteral("affection"));
+                m_settingsOrg, QStringLiteral("affection"));
     s.setValue(QStringLiteral("point"),             m_point);
     s.setValue(QStringLiteral("day"),               m_day.toString(Qt::ISODate));
     s.setValue(QStringLiteral("petUsed"),           m_petUsed);
     s.setValue(QStringLiteral("feedUsed"),          m_feedUsed);
+    s.setValue(QStringLiteral("chatUsed"),          m_chatUsed);
+    s.setValue(QStringLiteral("companyAccMs"),      m_companyAccMs);
     s.setValue(QStringLiteral("todayGain"),         m_todayGain);
     s.setValue(QStringLiteral("todayDecay"),        m_todayDecay);
     s.setValue(QStringLiteral("todayCompany"),      m_todayCompany);
@@ -357,11 +370,15 @@ void AffectionSystem::load()
         return;
 
     QSettings s(QSettings::IniFormat, QSettings::UserScope,
-                QStringLiteral("PetPal"), QStringLiteral("affection"));
+                m_settingsOrg, QStringLiteral("affection"));
 
     m_point             = s.value(QStringLiteral("point"), 0.0).toDouble();
     m_petUsed           = s.value(QStringLiteral("petUsed"), 0).toInt();
     m_feedUsed          = s.value(QStringLiteral("feedUsed"), 0).toInt();
+    // 老存档没有这两个键 —— 取默认 0 就是"额度还没用"，和补字段之前的行为一致，
+    // 升级不炸。新存档才带着真实计数。
+    m_chatUsed          = s.value(QStringLiteral("chatUsed"), 0).toInt();
+    m_companyAccMs      = s.value(QStringLiteral("companyAccMs"), qint64(0)).toLongLong();
     m_todayGain         = s.value(QStringLiteral("todayGain"), 0.0).toDouble();
     m_todayDecay        = s.value(QStringLiteral("todayDecay"), 0.0).toDouble();
     m_todayCompany      = s.value(QStringLiteral("todayCompany"), 0.0).toDouble();

@@ -40,7 +40,12 @@ public:
 
     // persistent = false 时完全不碰存档文件（--affectiontrace 用，
     // 免得自检把用户真正的数据改了）。
-    explicit AffectionSystem(bool persistent = true, QObject* parent = nullptr);
+    // settingsOrg 是 QSettings 的组织名，同时决定存档位置
+    // （%APPDATA%/<settingsOrg>/affection.ini）。生产环境永远是默认的 "PetPal"；
+    // 只有自检里那条"存档往返"用例会传一个沙箱名 —— 它必须真写盘真读盘才能
+    // 验证额度字段没漏（见 AffectionSystem.cpp 里 save() 上方那段说明）。
+    explicit AffectionSystem(bool persistent = true, QObject* parent = nullptr,
+                             const QString& settingsOrg = QStringLiteral("PetPal"));
     ~AffectionSystem() override;
 
     // ---------- 查询 ----------
@@ -140,4 +145,5 @@ private:
     qint64 m_lastSettleMs = 0;       // 上次结算到哪个时刻
     QTimer* m_timer = nullptr;
     bool    m_persistent = true;
+    QString m_settingsOrg = QStringLiteral("PetPal");   // 存档组织名，默认值 = 生产环境
 };

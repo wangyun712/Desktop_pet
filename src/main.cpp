@@ -21,6 +21,7 @@
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
+#include <QFileInfo>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
@@ -660,6 +661,68 @@ static int runSelfTest()
                 ts << pet.describeAffection();
                 ts.flush();
                 f.close();
+            }
+        }
+
+        // ---------- 存档往返：每日额度必须能挺过一次"关掉再打开" ----------
+        // ★ 为什么非要单独测这一节 ★
+        //   --affectiontrace 用的是 persistent=false，根本不碰存档 ——
+        //   所以"字段加了、却忘了写进 save()/load()"这类错误它一条都抓不到。
+        //   2026-09-29 就是这么漏掉 chatUsed 的：当天关掉程序再打开，聊天加分
+        //   额度直接回满 5 次，每天 15 分的上限变成可以靠重开程序反复刷。
+        //   这里用一个独立的 QSettings 组织名当沙箱，真写盘、真读盘，
+        //   不碰 %APPDATA%/PetPal 里用户的真实数据；跑完把沙箱文件删掉。
+        {
+            const QString sandboxOrg = QStringLiteral("PetPalSelfTest");
+            const int     usedPlanned = 3;
+
+            // 先拿路径、清掉上一次自检留下的残留，保证每次都从"额度全满"开始
+            QString sandboxPath;
+            {
+                AffectionSystem seed(/*persistent=*/true, nullptr, sandboxOrg);
+                seed.debugStopTimer();
+                sandboxPath = seed.savePath();
+            }
+            QFile::remove(sandboxPath);
+
+            {
+                AffectionSystem a(/*persistent=*/true, nullptr, sandboxOrg);
+                a.debugStopTimer();                 // 别让 30 秒的结算定时器插进来
+                for (int i = 0; i < usedPlanned; ++i)
+                    a.addSource(AffectionSystem::Source::Chat, PetCfg::AFF_CHAT_POINT);
+            }                                       // 析构会再 save() 一次
+
+            int leftAfterReload = -999;
+            {
+                AffectionSystem b(/*persistent=*/true, nullptr, sandboxOrg);  // 构造即 load()
+                b.debugStopTimer();
+                leftAfterReload = b.chatLeftToday();
+            }
+
+            const int expect = PetCfg::AFF_CHAT_PER_DAY - usedPlanned;
+
+            QFile f(exeDir.filePath(QStringLiteral("petpal_selftest.txt")));
+            if (f.open(QIODevice::Append | QIODevice::Text))
+            {
+                QTextStream ts(&f);
+                ts.setEncoding(QStringConverter::Utf8);
+                ts << QStringLiteral("\r\n--- 存档往返（每日额度）---\r\n");
+                ts << QStringLiteral("  沙箱存档  : %1\r\n").arg(sandboxPath);
+                ts << QStringLiteral("  用掉聊天  : %1 次（每日上限 %2）\r\n")
+                          .arg(usedPlanned).arg(PetCfg::AFF_CHAT_PER_DAY);
+                ts << QStringLiteral("  重读后剩余: %1 次（应为 %2）\r\n")
+                          .arg(leftAfterReload).arg(expect);
+                ts << (leftAfterReload == expect
+                           ? QStringLiteral("     额度完整地活过了关掉再打开\r\n")
+                           : QStringLiteral("     [!!] 额度没进存档 —— 检查 AffectionSystem::save()/load()\r\n"));
+                ts.flush();
+                f.close();
+            }
+
+            if (!sandboxPath.isEmpty())
+            {
+                QFile::remove(sandboxPath);                     // 沙箱文件
+                QDir().rmdir(QFileInfo(sandboxPath).absolutePath());   // 空目录一并收走
             }
         }
 
