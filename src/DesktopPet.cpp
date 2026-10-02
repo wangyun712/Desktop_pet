@@ -37,6 +37,10 @@
 #include <QtMath>
 #include <QDebug>
 
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+
 // Win32：只为把"始终置顶"重新钉回去（见下面 ensureOnTop）。
 // 必须放在所有 Qt 头之后 —— windows.h 会定义 min/max 两个宏，
 // 先引它会把后面 Qt 头里的 std::min/std::max 全部搞乱。
@@ -1603,10 +1607,10 @@ void DesktopPet::buildMenu()
         hideToTray();
     });
 
-    // 退出程序：qApp->quit() 会让 main() 里的 app.exec() 返回
-    m_menu->addAction(QStringLiteral("退出"), this, []()
+    // 退出程序：走 quitApp()（撤托盘 + quit + 5 秒保险丝），保证进程一定结束
+    m_menu->addAction(QStringLiteral("退出"), this, [this]()
     {
-        QApplication::quit();
+        quitApp();
     });
 
     // ---- 菜单里的"玩耍"动作统一记好感度 ----
@@ -1691,9 +1695,9 @@ void DesktopPet::setupTray()
         restoreFromTray();
     });
     m_trayMenu->addSeparator();
-    m_trayMenu->addAction(QStringLiteral("退出"), this, []()
+    m_trayMenu->addAction(QStringLiteral("退出"), this, [this]()
     {
-        QApplication::quit();
+        quitApp();                         // 和桌宠右键菜单同一个出口
     });
     m_tray->setContextMenu(m_trayMenu);
 
@@ -1722,6 +1726,8 @@ void DesktopPet::hideToTray()
     //   · goIdle() 回到站立，状态栏图标用的也是这张站姿图，视觉上对得上。
     stopMoving();
     goIdle();
+    if (m_fx)
+        m_fx->stopSpectrum();          // 脚下的频谱柱也收掉，别飘在桌面上
 
     // 记住用户原本有没有暂停自动行为，回来时原样还回去（别擅自帮他打开）
     m_autoBeforeHide = m_behavior->autoEnabled();
@@ -1768,6 +1774,55 @@ void DesktopPet::restoreFromTray()
     m_affection->setCompanyActive(true);
 
     m_behavior->notifyUserInteraction();   // 清零"多久没互动"，别一放出来就犯困
+}
+
+// =============================================================================
+//  单实例唤起：第二个 exe 进程敲门，已有实例把桌宠带回最前
+//
+//  只做"把桌宠叫回来"这一件事（用户要求，不开面板）：藏进托盘的走现成的
+//  restoreFromTray（撤托盘图标 -> show -> 恢复心跳/自动行为/陪伴，一条龙）；
+//  没藏的原地 show + 重钉置顶 —— show() 对已可见窗口不触发 showEvent，
+//  ensureOnTop 得显式补一遍（幂等，重复钉没有副作用）。
+// =============================================================================
+void DesktopPet::bringToFront()
+{
+    if (m_hiddenToTray && trayReady())
+    {
+        restoreFromTray();
+        return;
+    }
+    show();
+    ensureOnTop();
+}
+
+// =============================================================================
+//  退出程序 —— 唯一的出口（桌宠右键菜单「退出」/ 托盘菜单「退出」共用）
+//
+//  ★「按退出必须真的结束」是硬承诺（用户要求）★ 常规链路是
+//  QApplication::quit() -> exec() 返回 -> main() 收尾。但退出瞬间可能还有
+//  后台活计：在线流的音频回调在等网络补数据、B 站转码的 detached 线程、
+//  曲库扫描线程……任何一处吊住，进程就会在任务管理器里赖着不走（用户踩过）。
+//  所以：先撤托盘图标（防"幽灵图标"），再 quit()，并点一枚 **5 秒保险丝** ——
+//  正常退出先完成就啥事没有；万一真被吊住，到点强制结束进程。
+//  （强制路径跳过收尾：%TEMP% 下载缓存由下次启动的清残留兜底。）
+// =============================================================================
+void DesktopPet::quitApp()
+{
+    // ★ 先让桌面上立刻消失 ★ 收尾（音频设备释放/网络断开/临时目录清理）还要
+    // 零点几秒到几秒，窗口留着就是“点了退出却半天不走”（用户反馈的体感）。
+    // 全部顶层窗一并藏：桌宠、主面板、气泡、特效层、桌面歌词……
+    for (QWidget* w : QApplication::topLevelWidgets())
+        w->hide();
+    if (m_tray)
+        m_tray->hide();
+
+    QApplication::quit();
+
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        std::_Exit(3);                     // 跳过析构的硬退出:只剩它能把"吊住"救回来;
+                                           // 退出码 3 与正常退出的 0 区分,排障时一眼可辨
+    }).detach();
 }
 
 // -----------------------------------------------------------------------------
@@ -1891,11 +1946,19 @@ QString DesktopPet::debugMinimizeRoundTrip()
     const bool restoredOk = !IsIconic(hwnd);
     s += QStringLiteral("  SC_RESTORE 后   : 面板最小化=%1\r\n").arg(yn(IsIconic(hwnd) != 0));
 
-    m_panel->hide();                           // 测完把面板收回去（openPanel(false) 的原状）
+    // ↓↓↓ 任务栏右键菜单「关闭窗口」/ Alt+F4 发的就是这条 ↓↓↓
+    // 面板必须只是藏起来（closeEvent 拦下转 hide），桌宠必须还活着 ——
+    // 不然用户关个面板整个程序都退了（正是用户报过的那个问题）。
+    ::PostMessageW(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+    pump(300);
+    const bool closeOk = !IsWindowVisible(hwnd) && isVisible() && m_tick->isActive();
+    s += QStringLiteral("  SC_CLOSE 后     : 面板可见=%1  桌宠可见=%2  心跳=%3（面板应藏、桌宠应活）\r\n")
+             .arg(yn(IsWindowVisible(hwnd) != 0), yn(isVisible()), yn(m_tick->isActive()));
+    m_panel->hide();                           // 与 openPanel(false) 的原状对齐
 
-    const bool ok = box && minOk && restoredOk;
-    s += ok ? QStringLiteral("  [OK] 面板的任务栏最小化/复原（原生切换）正常\r\n")
-            : QStringLiteral("  [!!] 原生切换断了 —— 检查 MainPanel 构造里补的 WS_MINIMIZEBOX\r\n");
+    const bool ok = box && minOk && restoredOk && closeOk;
+    s += ok ? QStringLiteral("  [OK] 面板的任务栏最小化/复原/关闭全部正常（关闭不牵连桌宠）\r\n")
+            : QStringLiteral("  [!!] 原生切换或关闭联动断了 —— 检查 MainPanel 的 WS_MINIMIZEBOX / closeEvent\r\n");
     return s;
 #else
     return QStringLiteral("  [跳过] 仅 Windows 有任务栏最小化链路\r\n");
@@ -1990,6 +2053,9 @@ void DesktopPet::openPanel(bool showPanel)
         //  别的页都跟桌宠有来有往，只有它安安静静待在那儿。
         m_playerPage = new PlayerPage(m_panel);
         m_panel->addPage(QStringLiteral("播放器"), m_playerPage);
+
+        // 音频频谱：播放器 30fps 喂频段能量，特效层画在桌宠脚下（音乐一响脚下蹦）
+        connect(m_playerPage, &PlayerPage::spectrumTick, m_fx, &PetFx::setSpectrum);
 
         // ---- 设置页 ----
         // 弹窗确认已经在页面里做完了（那是界面自己的事），这里收到的信号

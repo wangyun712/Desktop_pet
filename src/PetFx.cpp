@@ -1,5 +1,6 @@
 #include "PetFx.h"
 #include "UiFont.h"
+#include "UiTheme.h"
 
 #include <QGuiApplication>
 #include <QPainter>
@@ -16,7 +17,7 @@ namespace {
 
 constexpr int kMarginX   = 50;    // 特效层比桌宠左右各宽出的余量
 constexpr int kTopRoom   = 170;   // 头顶上方的活动空间（心能飘多高）
-constexpr int kBottomPad = 14;    // 底部余量（心的出生点略进桌宠头顶）
+constexpr int kBottomPad = 30;    // 底部余量：脚下频谱柱的高度上限（原 14，加高给柱子）
 constexpr int kTickMs    = 33;    // 粒子推进周期
 constexpr int kFollowMs  = 30;    // 跟随轮询周期（和推进共用一拍）
 constexpr int kZzzMs     = 1100;  // 睡觉时飘 Z 的间隔
@@ -109,6 +110,36 @@ void PetFx::petMoved()
 }
 
 // =============================================================================
+//  音频频谱（桌宠脚下）
+// =============================================================================
+void PetFx::setSpectrum(const QVector<float>& bands)
+{
+    m_spec = bands;
+
+    // ★ 0.01 判活阈值和 PlayerPage::pullSpectrum 的 0.004 钳位是配套契约 ★
+    //   （衰减最后一拍必然小于 0.01 → 这边判死 → 特效窗正常收工。）
+    bool alive = false;
+    for (float v : m_spec)
+        if (v > 0.01f) { alive = true; break; }
+
+    // ★ 按"桌宠可见"门禁 ★ 桌宠藏进托盘时柱子绝不能独自飘在桌面上；
+    // 回来之后 PlayerPage 下一拍（33ms）就到，无需额外的恢复路径。
+    m_specAlive = alive && m_pet && m_pet->isVisible();
+
+    if (m_specAlive)
+        ensureRunning();               // 摆位 + 显窗 + 起定时器
+    else if (isVisible())
+        update();                      // 归零的最后一眼，收工交给 tick
+}
+
+void PetFx::stopSpectrum()
+{
+    m_spec.clear();
+    m_specAlive = false;
+    update();
+}
+
+// =============================================================================
 //  推进 / 摆位 / 收工
 // =============================================================================
 void PetFx::tick()
@@ -137,8 +168,8 @@ void PetFx::tick()
         ++it;
     }
 
-    // 没活了（粒子飘完、也没在睡觉）→ 收工：定时器停 + 窗隐藏，零开销
-    if (m_particles.isEmpty() && !m_sleeping)
+    // 没活了（粒子飘完、没在睡觉、频谱也没柱子）→ 收工：定时器停 + 窗隐藏，零开销
+    if (m_particles.isEmpty() && !m_sleeping && !m_specAlive)
     {
         m_tickTimer->stop();
         hide();
@@ -146,7 +177,7 @@ void PetFx::tick()
     }
 
     // 睡觉但这一拍还没新 Z：不用重绘，摆位照常（桌宠可能在走路）
-    if (!m_particles.isEmpty())
+    if (!m_particles.isEmpty() || m_specAlive)
         update();
     placeOver();
 }
@@ -264,6 +295,34 @@ void PetFx::paintEvent(QPaintEvent* event)
             p.setPen(Qt::NoPen);
             p.setBrush(QColor(255, 107, 138, int(alpha * 230)));
             p.drawPath(heartPath(pt.pos, pt.size));
+        }
+    }
+
+    // ---- 音频频谱：桌宠脚下的均衡器块 ----
+    // ★ 经典均衡器样式（用户选定）★ 整个频谱块悬在脚下黑区：柱根在块的
+    // 底线（脚线下方一点），往上长，柱头最高顶到脚线 —— 不是从脚线往下垂。
+    // 柱区 = 桌宠本体的横向范围（特效窗比桌宠左右各宽 kMarginX）。
+    if (m_specAlive && !m_spec.isEmpty() && m_lastPetGeo.isValid())
+    {
+        const QRect petLocal(m_lastPetGeo.topLeft() - geometry().topLeft(),
+                             m_lastPetGeo.size());
+        const qreal bandW = qreal(petLocal.width()) / m_spec.size();
+        const QColor base = UiTheme::color(UiTheme::Accent);
+        const int   maxH  = kBottomPad - 6;    // 柱子最大高度（上下各留点呼吸）
+        const qreal baseY = petLocal.bottom() + kBottomPad - 2;   // 块的底线（柱根）
+
+        for (int i = 0; i < m_spec.size(); ++i)
+        {
+            const qreal h = qBound(0.0, qreal(m_spec.at(i)), 1.0) * maxH;
+            if (h < 1.5)
+                continue;                      // 安静的频段不画,别留一排矮桩
+            const QRectF bar(petLocal.left() + i * bandW + bandW * 0.18,
+                             baseY - h,
+                             bandW * 0.64, h);
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(base.red(), base.green(), base.blue(),
+                              130 + int(100 * h / maxH)));
+            p.drawRoundedRect(bar, 2, 2);
         }
     }
 }

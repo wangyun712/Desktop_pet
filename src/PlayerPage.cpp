@@ -46,6 +46,128 @@
 
 #include <utility>
 
+#include <cmath>
+
+// -----------------------------------------------------------------------------
+//  音频频谱的数学件（纯函数，供 pullSpectrum 每 33ms 调一次）
+//
+//  数据链：AudioPlayer 的音频回调把单声道样本写进无锁环形缓冲 →
+//  这里 33ms 拉一次快照 → 1024 点 FFT → 16 个对数频段求能量 →
+//  平滑后发给特效层画在桌宠脚下。基频 48kHz 是 AudioPlayer 的固定输出格式。
+// -----------------------------------------------------------------------------
+namespace {
+
+constexpr int kSpecBands = 16;
+constexpr int kFftSize   = 1024;          // ≈21ms @48kHz，够分辨低频段
+constexpr float kPi      = 3.14159265358979f;
+
+// 原地 radix-2 FFT（迭代版，n 必须是 2 的幂）。30fps 下一次 ≈2 万次蝶形，
+// 主线程毫无压力，不值得为此引第三方库。
+void fftInPlace(float* re, float* im, int n)
+{
+    for (int i = 1, j = 0; i < n; ++i)                // 位反转置换
+    {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1)
+            j ^= bit;
+        j ^= bit;
+        if (i < j)
+        {
+            qSwap(re[i], re[j]);
+            qSwap(im[i], im[j]);
+        }
+    }
+    for (int len = 2; len <= n; len <<= 1)
+    {
+        const float ang  = -2.0f * kPi / float(len);
+        const float wr   = std::cos(ang);
+        const float wi   = std::sin(ang);
+        for (int i = 0; i < n; i += len)
+        {
+            float cr = 1.0f, ci = 0.0f;
+            for (int j = 0; j < len / 2; ++j)
+            {
+                const float ur = re[i + j],              ui = im[i + j];
+                const float xr = re[i + j + len / 2],    xi = im[i + j + len / 2];
+                const float vr = xr * cr - xi * ci;
+                const float vi = xr * ci + xi * cr;
+                re[i + j]           = ur + vr;
+                im[i + j]           = ui + vi;
+                re[i + j + len / 2] = ur - vr;
+                im[i + j + len / 2] = ui - vi;
+                const float nr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = nr;
+            }
+        }
+    }
+}
+
+// 频段表：50Hz~12kHz 对数切 16 段。高频段给感知增益 —— 音乐能量集中在
+// 低频，不抬一手就只有头两根柱在蹦，后 14 根等于白画。
+struct SpectrumTables
+{
+    int   lo[kSpecBands];
+    int   hi[kSpecBands];
+    float gain[kSpecBands];
+
+    SpectrumTables()
+    {
+        const float binHz = 48000.0f / float(kFftSize);
+        const float fLo   = 50.0f, fHi = 12000.0f;
+        for (int i = 0; i < kSpecBands; ++i)
+        {
+            const float b0 = fLo * std::pow(fHi / fLo, float(i)     / kSpecBands);
+            const float b1 = fLo * std::pow(fHi / fLo, float(i + 1) / kSpecBands);
+            lo[i] = qBound(1, int(b0 / binHz), kFftSize / 2 - 1);
+            hi[i] = qBound(lo[i] + 1, int(b1 / binHz), kFftSize / 2);
+            gain[i] = 1.0f + 0.35f * float(i);
+        }
+    }
+};
+
+const SpectrumTables specTables()
+{
+    static const SpectrumTables t;        // 函数内静态：首次使用时建一次
+    return t;
+}
+
+// frames → 16 个频段能量 [0,1]。汉宁窗压频谱泄漏；满幅正弦经窗后的谱峰
+// ≈ n/4，按这个基准归一，再整体乘一点感度。
+void computeSpectrumBands(const float* frames, int count, float* out)
+{
+    static float re[kFftSize], im[kFftSize];      // 主线程专用，无锁可 static
+
+    const int n = qMin(count, kFftSize);
+    for (int i = 0; i < n; ++i)
+    {
+        const float w = 0.5f * (1.0f - std::cos(2.0f * kPi * float(i) / float(n - 1)));
+        re[i] = frames[i] * w;
+        im[i] = 0.0f;
+    }
+    for (int i = n; i < kFftSize; ++i)
+    {
+        re[i] = 0.0f;
+        im[i] = 0.0f;
+    }
+    fftInPlace(re, im, kFftSize);
+
+    const SpectrumTables t = specTables();
+    for (int b = 0; b < kSpecBands; ++b)
+    {
+        float sum = 0.0f;
+        for (int k = t.lo[b]; k < t.hi[b]; ++k)
+        {
+            const float mag = std::sqrt(re[k] * re[k] + im[k] * im[k]);
+            sum += mag;
+        }
+        const float avg = sum / float(qMax(1, t.hi[b] - t.lo[b]));
+        out[b] = qBound(0.0f, avg / (kFftSize * 0.25f) * t.gain[b] * 1.6f, 1.0f);
+    }
+}
+
+} // namespace
+
 // -----------------------------------------------------------------------------
 //  歌词高亮用的强调色（主题的深强调角色，和样式表里那套 accent 是一组，
 //  深一档好压住灰底）。★ 是函数不是常量 ★ —— 主题切换后颜色要跟着变，
@@ -600,6 +722,15 @@ PlayerPage::PlayerPage(QWidget* parent) : QWidget(parent)
         m_nowLabel->setText(msg);
     });
 
+    // ---- 音频频谱 ----（数学件在文件顶部；画在桌宠脚下，PetFx 接信号）
+    // 33ms 一拍和 PetFx 的粒子推进同一个节拍。不播时这一拍只做衰减，
+    // 衰减到零就停发信号 —— 特效层收工，零开销。
+    m_specLevels = QVector<float>(kSpecBands, 0.0f);
+    m_specTimer = new QTimer(this);
+    m_specTimer->setInterval(33);
+    connect(m_specTimer, &QTimer::timeout, this, &PlayerPage::pullSpectrum);
+    m_specTimer->start();
+
     // 音量：先读存档再设，免得用户每次打开都要重调
     {
         QSettings s;
@@ -670,7 +801,12 @@ PlayerPage::PlayerPage(QWidget* parent) : QWidget(parent)
             this, [this]() { setDesktopLyricsEnabled(false); });
 }
 
-PlayerPage::~PlayerPage() = default;
+PlayerPage::~PlayerPage()
+{
+    // 桌面歌词是无 parent 的独立顶层窗（同 PetBubble/PetFx 的规矩），手动回收
+    delete m_desktopLyrics;
+    m_desktopLyrics = nullptr;
+}
 
 // =============================================================================
 //  搭界面
@@ -869,6 +1005,13 @@ void PlayerPage::buildUi()
     m_playBtn->setObjectName(QStringLiteral("playerPlay"));
     m_playBtn->setToolTip(QStringLiteral("播放 / 暂停"));
     connect(m_playBtn, &QPushButton::clicked, this, &PlayerPage::togglePlayPause);
+
+    // 空格 = 播放/暂停，仅当【面板开着 + 正在播放器页】时生效（用户要求）。
+    // ★ 用应用级事件过滤器实现（eventFilter 顶部那段），不能用 QShortcut ★：
+    // 按钮类控件会借 ShortcutOverride 把空格抢去自己用 —— 上次点过的按钮
+    // 留在焦点上，按空格等于再按那个按钮（− 按钮留着焦点时按空格 = 最小化
+    // 面板，用户踩过）。装在 qApp 上，才能赶在所有控件之前看到按键。
+    qApp->installEventFilter(this);
 
     m_nextBtn = new PlayerIconButton(PlayIconKind::Next, 32, this);
     m_nextBtn->setObjectName(QStringLiteral("playerTransport"));
@@ -1540,6 +1683,41 @@ void PlayerPage::togglePlayPause()
     m_player->togglePlayPause();
 }
 
+// =============================================================================
+//  音频频谱：33ms 一拍，拉样本 → FFT → 频段能量 → 平滑 → 发给特效层
+//
+//  · 只在播放中拉新数据；不播时只做衰减（×0.82 拍）—— 柱子"缓缓落回去"
+//    比戛然而止好看，衰减到零就停发信号，特效层随之收工；
+//  · 桌宠藏进托盘也没关系：PetFx 那边按"桌宠可见"门禁，不会柱子满天飞。
+// =============================================================================
+void PlayerPage::pullSpectrum()
+{
+    QVector<float> target(kSpecBands, 0.0f);
+    if (m_player && m_player->isPlaying())
+    {
+        float frames[kFftSize];
+        const int n = m_player->readSpectrum(frames, kFftSize);
+        if (n == kFftSize)
+            computeSpectrumBands(frames, n, target.data());
+    }
+
+    bool alive = false;
+    for (int i = 0; i < kSpecBands; ++i)
+    {
+        float& lv = m_specLevels[i];
+        lv = target[i] > lv ? target[i] : lv * 0.82f;   // 起跳快、回落慢
+        // ★ 0.004 这个钳位和 PetFx::setSpectrum 的 0.01 判活阈值是配套契约 ★
+        //   衰减序列的最后一拍必然落在 (0.004×0.82, 0.004] ⊂ (0, 0.01) ——
+        //   PetFx 判死、特效窗正常收工。改这边阈值前先看那边，别把收工逻辑改坏。
+        if (lv < 0.004f)
+            lv = 0.0f;
+        alive = alive || lv > 0.0f;
+    }
+
+    if (alive)
+        emit spectrumTick(m_specLevels);
+}
+
 // 一首放完了，接下来往哪走 —— 这里才是播放模式真正起作用的地方：
 //   · 单曲循环 —— 原地重播这一首
 //   · 随机     —— 随便挑另一首
@@ -1595,8 +1773,10 @@ void PlayerPage::onPositionChanged(qint64 ms)
     {
         const int idx = lyricIndexAt(m_lyricLines, ms);
         if (idx != m_lyricCurrent)
-            highlightLyric(idx);
-    }
+            highlightLyric(idx);           // 换行：列表高亮 + 桌面歌词换行（内部会刷）
+        else
+            updateDesktopLyrics();         // 行内：刷卡拉OK渐变进度（200ms 一拍，
+    }                                      //  setLine 量化去重，进度没变就不重绘）
 }
 
 void PlayerPage::onDurationChanged(qint64 ms)
@@ -1953,6 +2133,26 @@ void PlayerPage::placeLyricRecenterBtn()
 
 bool PlayerPage::eventFilter(QObject* watched, QEvent* event)
 {
+    // ---- 空格 = 播放/暂停（应用级过滤，安装见构造函数）----
+    // 必须赶在控件之前接住：按钮一类带焦点的控件会通过 ShortcutOverride 把
+    // 空格抢走 —— 上次点过的按钮留在焦点上，按空格等于"再按一下那个按钮"，
+    // 面板的 − 按钮要是恰好留着焦点，按空格就把面板最小化了（用户踩到过）。
+    // 所以：面板在前台时，只要焦点不在输入框里，空格一律由这里处置 ——
+    //   · 正在播放器页：切换播放/暂停（空态有兜底：没歌就播列表第一首）；
+    //   · 在别的页：什么都不做，但也绝不落到留有焦点的按钮上。
+    if (event->type() == QEvent::KeyPress && window()->isActiveWindow())
+    {
+        const auto* ke = static_cast<const QKeyEvent*>(event);
+        if (ke->key() == Qt::Key_Space
+            && !qobject_cast<const QLineEdit*>(QApplication::focusWidget()))
+        {
+            // 长按产生的自动重复也一并吞掉：切换只认首按，重复事件绝不下放
+            if (!ke->isAutoRepeat() && isVisible())
+                togglePlayPause();
+            return true;
+        }
+    }
+
     // 双击歌词行 = 跳到这一句。m_lyricLabels 里只存活着的行（clearLyrics 会
     // 连人带名一起清），所以 indexOf 命中的必然是还活着的那个。
     if (event->type() == QEvent::MouseButtonDblClick)
@@ -2001,12 +2201,29 @@ void PlayerPage::updateDesktopLyrics()
         return;
     }
 
+    // 卡拉OK渐变进度：当前行已唱比例 [0,1]。行终点 = 下一行起点；最后一行用
+    // 曲目时长兜底；无时间戳的纯文本行（timeMs<0）给 -1 = 不渐变（整句强调色）。
+    const auto progressFor = [this](int idx) -> float {
+        if (idx < 0 || idx >= m_lyricLines.size())
+            return -1.0f;
+        const qint64 start = m_lyricLines.at(idx).timeMs;
+        if (start < 0)
+            return -1.0f;
+        qint64 end = m_player->durationMs();
+        if (idx + 1 < m_lyricLines.size() && m_lyricLines.at(idx + 1).timeMs > start)
+            end = m_lyricLines.at(idx + 1).timeMs;
+        if (end <= start)
+            return -1.0f;
+        return qBound(0.0f, float(m_player->positionMs() - start) / float(end - start), 1.0f);
+    };
+
     if (m_lyricCurrent >= 0 && m_lyricCurrent < m_lyricLines.size())
     {
         QString next;
         if (m_lyricCurrent + 1 < m_lyricLines.size())
             next = m_lyricLines.at(m_lyricCurrent + 1).text;
-        m_desktopLyrics->setLine(m_lyricLines.at(m_lyricCurrent).text, next);
+        m_desktopLyrics->setLine(m_lyricLines.at(m_lyricCurrent).text, next,
+                                 progressFor(m_lyricCurrent));
         return;
     }
 
@@ -2767,6 +2984,63 @@ QString PlayerPage::describePlayer()
                    : QStringLiteral("  [!!] 「词」按钮没跟上开关 —— 检查 setDesktopLyricsEnabled\r\n");
     }
 
+    // ---------------- ⑦ 频谱数学 + 卡拉OK进度 ----------------
+    out += QStringLiteral("\r\n--- 频谱与卡拉OK ---\r\n");
+    {
+        // 频谱：合成 100Hz 正弦喂进去 —— 能量必须落在低频段（前 1/3），
+        // 高频段应当近乎为零；全零输入必须全零输出。
+        {
+            float sine[kFftSize];
+            for (int i = 0; i < kFftSize; ++i)
+                sine[i] = 0.8f * std::sin(2.0f * kPi * 100.0f * float(i) / 48000.0f);
+            float bands[kSpecBands] = {};
+            computeSpectrumBands(sine, kFftSize, bands);
+            float low = 0.0f, high = 0.0f;
+            for (int i = 0; i < kSpecBands / 3; ++i)                low  += bands[i];
+            for (int i = kSpecBands * 2 / 3; i < kSpecBands; ++i)   high += bands[i];
+
+            float zeroIn[kFftSize] = {};
+            float zeros[kSpecBands] = {};
+            computeSpectrumBands(zeroIn, kFftSize, zeros);
+            bool zeroOk = true;
+            for (float v : zeros)
+                zeroOk = zeroOk && v == 0.0f;
+
+            AudioPlayer ap;                        // 空播放器：拉频谱必须安全返回 0
+            float probe[8] = {};
+            const int got = ap.readSpectrum(probe, 8);
+
+            out += QStringLiteral("  100Hz 正弦:低频段能量 %1 / 高频段 %2;全零入→全零出=%3;空播放器取样=%4帧\r\n")
+                       .arg(low, 0, 'f', 3).arg(high, 0, 'f', 3)
+                       .arg(zeroOk ? QStringLiteral("是") : QStringLiteral("否")).arg(got);
+            out += (low > high * 3.0f && low > 0.05f && zeroOk && got == 0)
+                       ? QStringLiteral("  [OK] 频谱数学正常（能量聚在正弦所在频段）\r\n")
+                       : QStringLiteral("  [!!] 频谱能量分布不对 —— 检查 FFT / 频段表\r\n");
+        }
+
+        // 卡拉OK：离屏喂 0 / 0.5 / 1 三档进度 —— 渐变只换颜色不换形状，
+        // 几何必须纹丝不动（动态宽度只跟文本长度走，跟进度无关）。
+        {
+            DesktopLyrics dl;
+            dl.setAttribute(Qt::WA_DontShowOnScreen, true);
+            dl.show();
+            QApplication::processEvents();
+            dl.setLine(QStringLiteral("卡拉OK渐变测试句"), QString(), 0.0f);
+            QApplication::processEvents();
+            const QRect g0 = dl.geometry();
+            dl.setLine(QStringLiteral("卡拉OK渐变测试句"), QString(), 0.5f);
+            QApplication::processEvents();
+            dl.setLine(QStringLiteral("卡拉OK渐变测试句"), QString(), 1.0f);
+            QApplication::processEvents();
+            const QRect g1 = dl.geometry();
+            dl.setLine(QString(), QString());      // 收窗还原
+
+            out += (g0 == g1)
+                       ? QStringLiteral("  [OK] 卡拉OK进度不影响几何（只换颜色）\r\n")
+                       : QStringLiteral("  [!!] 进度把几何改了 —— 检查 setLine 去重/裁剪\r\n");
+        }
+    }
+
     return out;
 }
 
@@ -3069,6 +3343,17 @@ void PlayerPage::fetchAndPlay(int row, const TrackListModel::OnlineTrack& it,
                     return;
                 }
 
+                // ★ 同一首歌的并发转码去重 ★ 快速双击会同时走到这：两个转码线程
+                // 写同一个 .part 会产出交错残件，还能被缓存永久命中——此后每次点
+                // 这首都是坏文件。已经在编码/下载途中的直接拒绝（第一路会完成
+                // 下载、转码并播放）。
+                if (m_encoding.contains(flacPath))
+                {
+                    setTag(QStringLiteral("转码中…"));
+                    return;
+                }
+                m_encoding.insert(flacPath);
+
                 const QString m4aPath = m_saveDir + QLatin1Char('/') + base + QStringLiteral(".m4a");
                 OnlineMusic::download(url, m4aPath, dlHeaders(OnlineMusic::Bilibili),
                     [this, row](qint64 got, qint64 total) {
@@ -3079,6 +3364,7 @@ void PlayerPage::fetchAndPlay(int row, const TrackListModel::OnlineTrack& it,
                     [this, it, row, m4aPath, flacPath, registerFav, play, setTag](bool ok, const QString& err) {
                         if (!ok)
                         {
+                            m_encoding.remove(flacPath);
                             setTag(QStringLiteral("联网失败·%1").arg(netErrText(err)));
                             return;
                         }
@@ -3086,6 +3372,7 @@ void PlayerPage::fetchAndPlay(int row, const TrackListModel::OnlineTrack& it,
                         MfDecode::decodeToFlacAsync(this, m4aPath, flacPath, it.title, it.artist,
                             [this, it, m4aPath, flacPath, registerFav, play, setTag]
                             (bool ok, const QString& err) {
+                                m_encoding.remove(flacPath);
                                 Q_UNUSED(err);
                                 if (!ok)
                                 {

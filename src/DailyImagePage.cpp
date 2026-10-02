@@ -1,8 +1,10 @@
 #include "DailyImagePage.h"
+#include "PixivFetcher.h"
 #include "UiFont.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QButtonGroup>
 #include <QLabel>
 #include <QPushButton>
 #include <QDir>
@@ -30,6 +32,16 @@ namespace {
 // 停手多久之后才做那次"平滑"缩放。120ms 比双击间隔短，用户感觉不到延迟，
 // 又足够把一次连续拖动产生的一长串 resizeEvent 合并掉。
 constexpr int kRescaleSettleMs = 120;
+
+// 联网(Pixiv)标签的搜索词。负号 = 排除；产品搜索头同款条件
+// （tag 匹配 / 只看插画 / 全年龄 / 排除 AI / 长≥3000）。要换词改这里。
+QString pixivKeyword()
+{
+    return QStringLiteral("洛天依 -AI生成 -涩");
+}
+
+// 联网预取缓存的目标张数：换一换时命中缓存就是零等待
+constexpr int kOnlineCacheTarget = 5;
 
 // 源图最多留多清晰。
 //   ★ 判据是"面板最多能长多大"，不是"现在多大" ★
@@ -102,6 +114,13 @@ void DailyImagePage::applyStyle()
         }
         QPushButton#ghost:hover   { background: #EEEDFE; }
         QPushButton#ghost:pressed { background: #E3E0FB; }
+        QPushButton#dailyTab {
+            border: 1px solid #E3E1D9; border-radius: 6px;
+            background: #FFFFFF; color: #2C2C2A;
+            padding: 3px 12px; font-size: 12px;
+        }
+        QPushButton#dailyTab:hover   { border-color: #7F77DD; color: #534AB7; }
+        QPushButton#dailyTab:checked { background: #EEEDFE; color: #534AB7; border-color: #7F77DD; }
     )")));
 }
 
@@ -185,6 +204,29 @@ DailyImagePage::DailyImagePage(bool persistent, QWidget* parent)
     auto* title = new QLabel(QStringLiteral("每日图片"), this);
     title->setObjectName(QStringLiteral("cap"));
     head->addWidget(title);
+
+    // ★ 本地 / 联网 两个标签 ★ 本地 = 原有的"每日固定一张"；联网 = 从 Pixiv 现取。
+    //   照 PlayerPage「网易云/B站」曲源切换的先例：checkable + QButtonGroup 互斥。
+    m_localTab = new QPushButton(QStringLiteral("本地"), this);
+    m_localTab->setObjectName(QStringLiteral("dailyTab"));
+    m_localTab->setCheckable(true);
+    m_localTab->setCursor(Qt::PointingHandCursor);
+    m_localTab->setChecked(true);
+    head->addWidget(m_localTab);
+
+    m_onlineTab = new QPushButton(QStringLiteral("联网"), this);
+    m_onlineTab->setObjectName(QStringLiteral("dailyTab"));
+    m_onlineTab->setCheckable(true);
+    m_onlineTab->setCursor(Qt::PointingHandCursor);
+    m_onlineTab->setToolTip(QStringLiteral("从 Pixiv 搜图（需要能访问 pixiv.net，自动跟随系统代理）"));
+    head->addWidget(m_onlineTab);
+
+    m_modeGroup = new QButtonGroup(this);  // 默认互斥：同一时间只有一个标签
+    m_modeGroup->addButton(m_localTab, 0);
+    m_modeGroup->addButton(m_onlineTab, 1);
+    connect(m_modeGroup, &QButtonGroup::idClicked, this, [this](int id) {
+        setOnlineMode(id == 1);
+    });
 
     // 本次进度：「本次还剩 N 张没看过」。
     // ★ 刻意放标题右边（左边），不放「换一换」左边 ★ —— 这句长短会变
@@ -405,8 +447,14 @@ void DailyImagePage::refreshForToday()
     // 同一张图就不重复解码（面板关掉又打开时会走到这里）。
     // 但底部那行进度要重算：showEvent 刚把"本次已看过"重置过，
     // 继续挂着上一次的数字会让人以为重置没生效。
+    // ★ 还有联网标签这条来路 ★ 联网取图失败时 m_image 被"失败"文字占住
+    // （pixmap 已清），m_currentPath 却还是本地那张 —— 走到这里必须把
+    // pixmap 重新贴回去，不然切回本地就是一片"联网取图失败"（踩过）。
     if (path == m_currentPath && !m_source.isNull())
     {
+        m_image->setText(QString());
+        m_rescaleTimer->stop();
+        rescaleImage(/*smooth=*/true);
         m_caption->setText(captionText());
         updateProgressLabel();
         return;
@@ -504,6 +552,13 @@ void DailyImagePage::updateProgressLabel()
 // =============================================================================
 void DailyImagePage::onShuffle()
 {
+    // 联网标签：「换一换」= 从缓存弹下一张（缓存空则现场取,取到自动上屏）
+    if (m_onlineMode)
+    {
+        showNextOnline();
+        return;
+    }
+
     const QStringList files = scanImages();
 
     if (files.isEmpty())
@@ -579,6 +634,11 @@ void DailyImagePage::showEvent(QShowEvent* event)
 {
     QWidget::showEvent(event);
 
+    // 联网标签没有"每日一张"的语义,显示内容与日期无关 —— 切过来继续看
+    // 上次那张就行,别被本地逻辑刷掉
+    if (m_onlineMode)
+        return;
+
     // ★ 每次切到这一页，就重置"本次已看过" ★
     //   用户要的是"打开这一页、看着的时候别重复"，不需要跨次记忆，
     //   所以这个集合是纯内存态，在这里归零。
@@ -601,6 +661,36 @@ bool DailyImagePage::eventFilter(QObject* obj, QEvent* event)
 {
     if (obj == m_image && event->type() == QEvent::MouseButtonDblClick)
     {
+        // ---- 联网图：保存进本地图库 + 系统工具打开 ----
+        if (m_onlineMode)
+        {
+            if (m_onlineBytes.isEmpty())
+                return true;               // 还没图（正在取/失败）：双击无意义
+
+            if (m_dir.isEmpty())
+            {
+                m_caption->setText(QStringLiteral("没找到本地图库目录，保存不了 —— 先切到本地标签确认"));
+                return true;
+            }
+
+            // 文件名带作品 ID：同一张重复双击天然去重（存在就只打开不重写）
+            const QString name = QStringLiteral("pixiv_%1.jpg").arg(m_onlineId);
+            const QString path = m_dir + QLatin1Char('/') + name;
+            if (!QFile::exists(path))
+            {
+                QFile f(path);
+                if (f.open(QIODevice::WriteOnly))
+                    f.write(m_onlineBytes);
+            }
+
+            if (!QDesktopServices::openUrl(QUrl::fromLocalFile(path)))
+                m_caption->setText(QStringLiteral("已保存为 %1，但系统没有能打开它的程序").arg(name));
+            else
+                m_caption->setText(QStringLiteral("已保存到本地图库：%1（本地标签的「换一换」会抽到它）").arg(name));
+            return true;
+        }
+
+        // ---- 本地图：直接交给系统看图工具 ----
         if (m_currentPath.isEmpty())
             return true;
 
@@ -621,4 +711,229 @@ bool DailyImagePage::eventFilter(QObject* obj, QEvent* event)
     }
 
     return QWidget::eventFilter(obj, event);
+}
+
+// =============================================================================
+//  联网（Pixiv）标签
+//
+//  数据流：随机页码搜索（乱序入池）→ 逐张「详情 → 大图字节」进缓存 →
+//  「换一换」从缓存弹一张、后台补一张。缓存目标 5 张：命中就是零等待。
+//  ★ 全部内存态、不落盘 ★ 联网是"看图"，没有"每日固定一张"的语义；
+//  双击保存的图落进 daily_image 后自然归本地标签管（扫描机制现成）。
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+//  本地 / 联网 切换
+// -----------------------------------------------------------------------------
+void DailyImagePage::setOnlineMode(bool on)
+{
+    if (m_onlineMode == on)
+        return;
+
+    m_onlineMode = on;
+    m_progress->setVisible(!on);           // 「本次还剩 N 张」只属于本地标签
+
+    if (!on)
+    {
+        refreshForToday();                 // 回本地：按存档恢复每日那张
+        return;
+    }
+
+    // 第一次进联网标签：搜一批。之后切回联网都恢复上次的联网图（不重搜不重取）。
+    if (!m_onlineTried && m_onlinePool.isEmpty() && m_cache.isEmpty())
+    {
+        beginOnlineSearch();
+        return;
+    }
+
+    if (!m_onlineSource.isNull())
+    {
+        applyOnlineImage();                // 上次的联网图还在：直接恢复显示
+        m_caption->setText(QStringLiteral("「%1」 %2\u3000·\u3000双击保存到本地图库并打开")
+                               .arg(m_onlineTitle, m_onlineArtist));
+        return;
+    }
+
+    showNextOnline();                      // 搜过但一张都还没显示过（极端路径）
+}
+
+// -----------------------------------------------------------------------------
+//  随机页码搜一批（结果乱序入池）
+//
+//  ★ 页码必须是两段式 ★ 先查第 1 页拿到 lastPage（尺寸过滤后池子可能很小，
+//  本关键词实测 786 个作品只有 10 页），再随机跳到 [1, lastPage] 里的一页 ——
+//  直接随机 1~20 的话大多落在空页上，"联网取图失败"就是这么来的。
+//  随机页万一还是空（极端），回退用第 1 页那份结果，不让用户看到失败。
+// -----------------------------------------------------------------------------
+void DailyImagePage::beginOnlineSearch()
+{
+    m_onlineTried = true;
+    m_fetching    = true;
+    m_onlinePool.clear();
+    m_poolPos    = 0;
+    m_image->setText(QStringLiteral("正在从 Pixiv 搜索…"));
+    m_caption->setText(QStringLiteral("联网模式：正在搜索"));
+
+    const auto ingest = [this](const QVector<PixivFetcher::Illust>& list) {
+        m_onlinePool = list;
+        for (int i = m_onlinePool.size() - 1; i > 0; --i)
+            m_onlinePool.swapItemsAt(i, int(QRandomGenerator::global()->bounded(i + 1)));
+        m_poolPos = 0;
+        showNextOnline();                  // 搜到就上第一张（缓存还空，会边取边等）
+    };
+
+    PixivFetcher::search(pixivKeyword(), 1, this,
+        [this, ingest](bool ok, const QVector<PixivFetcher::Illust>& list,
+                       int lastPage, const QString& err) {
+            m_fetching = false;
+            if (!ok || list.isEmpty())
+            {
+                m_image->setText(QStringLiteral("联网取图失败"));
+                m_caption->setText(QStringLiteral("%1 — 点「换一换」重试").arg(err));
+                return;
+            }
+
+            const int page = (lastPage > 1)
+                ? 1 + int(QRandomGenerator::global()->bounded(qMin(lastPage, 20)))
+                : 1;
+            if (page == 1)
+            {
+                ingest(list);
+                return;
+            }
+
+            m_fetching = true;
+            PixivFetcher::search(pixivKeyword(), page, this,
+                [this, ingest, list](bool ok2, const QVector<PixivFetcher::Illust>& list2,
+                                     int, const QString& err2) {
+                    m_fetching = false;
+                    if (!ok2 || list2.isEmpty())
+                    {
+                        ingest(list);      // 随机页出了意外：回退用第 1 页的结果
+                        return;
+                    }
+                    ingest(list2);
+                });
+        });
+}
+
+// -----------------------------------------------------------------------------
+//  从池里取下一个：详情 → 大图字节 → 进缓存；偶发失败跳过，连败 3 次才报错
+// -----------------------------------------------------------------------------
+void DailyImagePage::prefetchNext()
+{
+    if (m_fetching)
+        return;
+
+    if (m_poolPos >= m_onlinePool.size())
+    {
+        beginOnlineSearch();               // 这一页用完了：随机换一页重搜
+        return;
+    }
+
+    const PixivFetcher::Illust info = m_onlinePool.at(m_poolPos++);
+    m_fetching = true;
+
+    PixivFetcher::fetchIllust(info.id, this,
+        [this](bool ok, const PixivFetcher::Illust& illust,
+               const QString& imageUrl, const QString& err) {
+            if (!ok)
+            {
+                m_fetching = false;
+                if (++m_failRun >= 3 && m_cache.isEmpty())
+                {
+                    m_image->setText(QStringLiteral("联网取图失败"));
+                    m_caption->setText(QStringLiteral("%1 — 点「换一换」重试").arg(err));
+                    return;
+                }
+                prefetchNext();            // 偶发失败：跳过这张接着拉
+                return;
+            }
+
+            PixivFetcher::fetchBytes(imageUrl, this,
+                [this, illust](bool ok2, const QByteArray& bytes, const QString& err2) {
+                    m_fetching = false;
+
+                    if (ok2)
+                    {
+                        QPixmap pm;
+                        pm.loadFromData(bytes);
+                        if (!pm.isNull())
+                        {
+                            OnlinePic p;
+                            p.info  = illust;
+                            p.bytes = bytes;
+                            p.pm    = pm;
+                            m_cache.append(p);
+                            m_failRun = 0;
+                        }
+                    }
+                    else
+                    {
+                        ++m_failRun;
+                    }
+
+                    if (m_cache.isEmpty())
+                    {
+                        if (m_failRun >= 3)
+                        {
+                            m_image->setText(QStringLiteral("联网取图失败"));
+                            m_caption->setText(QStringLiteral("%1 — 点「换一换」重试").arg(err2));
+                            return;
+                        }
+                        prefetchNext();    // 这张废了：接着拉下一张
+                        return;
+                    }
+
+                    if (m_awaitShow)
+                        showNextOnline();  // 用户在等：到货立刻上屏
+                    else if (m_cache.size() < kOnlineCacheTarget)
+                        prefetchNext();    // 继续把缓存填够
+                });
+        });
+}
+
+// -----------------------------------------------------------------------------
+//  从缓存弹一张显示；缓存空就催补货（到货自动上屏）
+// -----------------------------------------------------------------------------
+void DailyImagePage::showNextOnline()
+{
+    if (m_cache.isEmpty())
+    {
+        m_awaitShow = true;
+        m_image->setText(QStringLiteral("正在从 Pixiv 取图…"));
+        m_caption->setText(QStringLiteral("联网模式：后台取图中，马上就好"));
+        prefetchNext();
+        return;
+    }
+
+    const OnlinePic p = m_cache.takeFirst();
+    m_onlineBytes  = p.bytes;
+    m_onlineId     = p.info.id;
+    m_onlineTitle  = p.info.title;
+    m_onlineArtist = p.info.userName;
+    m_onlineSize   = p.pm.size();
+    m_onlineSource = downscaleSourceForDisplay(p.pm);
+    m_awaitShow    = false;
+    m_failRun      = 0;
+
+    applyOnlineImage();
+    prefetchNext();                        // 弹了一张，后台补一张
+
+    m_caption->setText(QStringLiteral("「%1」 %2\u3000·\u3000原图 %3 × %4\u3000·\u3000双击保存到本地图库并打开")
+                           .arg(m_onlineTitle, m_onlineArtist)
+                           .arg(m_onlineSize.width())
+                           .arg(m_onlineSize.height()));
+}
+
+// -----------------------------------------------------------------------------
+//  把联网图放进显示管线（m_source 那套缩放机制原样复用）
+// -----------------------------------------------------------------------------
+void DailyImagePage::applyOnlineImage()
+{
+    m_source = m_onlineSource;
+    m_currentPath.clear();                 // 联网图没有本地路径（双击走保存逻辑）
+    m_image->setText(QString());
+    m_rescaleTimer->stop();
+    rescaleImage(/*smooth=*/true);
 }

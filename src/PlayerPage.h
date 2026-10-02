@@ -38,6 +38,7 @@
 //    停手 250ms 再搜，配合 MusicLibrary 的"前缀收窄"，打字体验是跟手的。
 // =============================================================================
 
+#include <QSet>
 #include <QVector>
 #include <QWidget>
 
@@ -132,11 +133,15 @@ signals:
     // DesktopPet 拿它去同步设置页的勾选框 —— × 关闭是反向路径，勾选框不能留旧状态。
     void desktopLyricsEnabledChanged(bool on);
 
+    // 音频频谱：16 个频段能量 [0,1]，30fps 一拍，只在播放中发（安静/暂停时
+    // 衰减到零就停发）。DesktopPet 转给特效层，画在桌宠脚下。
+    void spectrumTick(const QVector<float>& bands);
+
 protected:
     void paintEvent(QPaintEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     void showEvent(QShowEvent* event) override;
-    bool eventFilter(QObject* watched, QEvent* event) override;   // 歌词区的滚轮接管
+    bool eventFilter(QObject* watched, QEvent* event) override;   // 歌词区滚轮接管 + 空格播放/暂停
 
 private slots:
     void onPickFolder();
@@ -205,6 +210,13 @@ private:
     MusicLibrary*   m_lib    = nullptr;
     TrackListModel* m_model  = nullptr;
     AudioPlayer*    m_player = nullptr;
+
+    // ---- 音频频谱（画在桌宠脚下，见 .cpp 顶部的数学件说明）----
+    void pullSpectrum();                    // 33ms 一拍：拉样本 → FFT → 频段 → 发信号
+    QTimer*        m_specTimer  = nullptr;
+    QVector<float> m_specLevels;            // 平滑后的频段能量（起跳快/回落慢）
+
+    QSet<QString>  m_encoding;              // 正在下载/转码的 B 站歌曲（按 flacPath 去重并发）
 
     // ---- 工具行 ----
     QPushButton* m_pickBtn    = nullptr;

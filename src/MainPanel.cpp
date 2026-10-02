@@ -12,11 +12,18 @@
 #include <QPainterPath>
 #include <QMouseEvent>
 #include <QKeyEvent>
+#include <QCloseEvent>
 #include <QShortcut>
 #include <QFile>
 #include <QScreen>
 #include <QGuiApplication>
 #include <QWindow>          // startSystemMove()（见 mousePressEvent 的说明）
+#include <QTimer>
+#include <QVariantAnimation>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <functional>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -36,6 +43,293 @@ constexpr int BASE_MIN_W = 560;    // 面板最小宽
 constexpr int BASE_MIN_H = 400;    // 面板最小高
 
 } // namespace
+
+// =============================================================================
+//  网络状态徽章 —— 顶部条 "PetPal" 右边的那颗小胶囊
+//
+//  长相：圆角胶囊底 + 一颗状态点 + 两个字（在线 / 离线 / 检测中）。
+//    · 在线   —— 绿点带一圈向外扩散的"呼吸环"，绿底绿字；
+//    · 离线   —— 静止的红点（断网没什么可"活"的，动效留给恢复），红底红字；
+//    · 检测中 —— 灰点带呼吸环，程序刚启动、第一次探测还没回来时的过渡态。
+//  呼吸环的用意：绿色说明"现在是好的"，但它是不是"刚刚才变好/正在波动"，
+//  静态图看不出来 —— 让环按探测节奏轻轻扩散，状态一眼就是"活的"。
+//
+//  实现是自绘而不是 QSS + 两个 QLabel：
+//    · 点、环、胶囊的几何要互相咬合（环从点的边缘长出去），QSS 拼不出这种细节；
+//    · 尺寸要跟字号档位走（UiFont::px），自绘时一处 sizeHint 就算清了。
+//  不吃鼠标事件：默认 QWidget 会忽略鼠标按下并冒泡给顶部条（见 mousePressEvent
+//  的注释），拖动不受影响；只挂了 tooltip。
+//
+//  ★ 这两个类放在全局作用域而不是匿名命名空间 ★
+//    MainPanel.h 里前置声明了 NetBadge（成员指针得有类型名），匿名命名空间里的
+//    同名类会和它撞成"不明确的符号"（MSVC C2872）。反正只在本文件里定义和使用，
+//    不会污染别的编译单元。
+// =============================================================================
+class NetBadge : public QWidget
+{
+public:
+    enum class State { Checking, Online, Offline };
+
+    explicit NetBadge(QWidget* parent) : QWidget(parent)
+    {
+        // 呼吸动画：0→1 线性循环，paintEvent 里换算成扩散环的半径和透明度。
+        // 只有几十像素宽的控件自己重画自己，开销可以忽略。
+        m_pulse = new QVariantAnimation(this);
+        m_pulse->setStartValue(0.0);
+        m_pulse->setEndValue(1.0);
+        m_pulse->setDuration(2200);
+        m_pulse->setLoopCount(-1);
+        connect(m_pulse, &QVariantAnimation::valueChanged, this, [this] { update(); });
+
+        setState(State::Checking);
+        refreshScale();
+    }
+
+    void setState(State s)
+    {
+        if (m_state == s)
+            return;
+        m_state = s;
+
+        setToolTip(stateTip(s));
+
+        // 离线时把动画停掉 —— 红点是静止的；在线/检测中都让它呼吸。
+        if (s == State::Offline)
+            m_pulse->stop();
+        else
+            m_pulse->start();
+
+        refreshScale();     // 文案宽度变了（"检测中…" vs "在线"），胶囊要跟着伸缩
+    }
+
+    // 字号档位变了（或状态文案变了）之后重算胶囊尺寸。applyUiScale() 会来调。
+    void refreshScale()
+    {
+        setFixedSize(sizeHint());
+        update();
+    }
+
+protected:
+    QSize sizeHint() const override
+    {
+        QFont f = badgeFont();
+        const int textW = QFontMetrics(f).horizontalAdvance(stateText(m_state));
+        const int w = UiFont::px(9) * 2   // 胶囊左右内边距
+                    + UiFont::px(6)       // 状态点直径
+                    + UiFont::px(5)       // 点和文字的间距
+                    + textW + 2;          // +2 给一圈 1px 描边
+        const int h = UiFont::px(20);
+        return QSize(w, h);
+    }
+
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setRenderHint(QPainter::TextAntialiasing, true);
+
+        p.setFont(badgeFont());
+
+        const int  padH = UiFont::px(9);
+        const int  dotD = UiFont::px(6);
+        const int  gap  = UiFont::px(5);
+        const QRectF pill(0.5, 0.5, width() - 1.0, height() - 1.0);
+
+        // ---- 胶囊底 + 描边（浅色实底压得住背景图，深色字在图上也不花）----
+        p.setPen(QPen(skinBorder(m_state), 1.0));
+        p.setBrush(skinFill(m_state));
+        p.drawRoundedRect(pill, pill.height() / 2.0, pill.height() / 2.0);
+
+        // ---- 状态点 ----
+        const QPointF dotC(padH + dotD / 2.0, height() / 2.0);
+
+        // 呼吸环：从点的边缘向外扩散、越扩越淡，到头重来。离线不画（静止）。
+        if (m_state != State::Offline)
+        {
+            const qreal ph  = m_pulse->currentValue().toReal();
+            const qreal rr  = dotD / 2.0 + 1.0 + ph * UiFont::px(4);
+            QColor halo = skinDot(m_state);
+            halo.setAlpha(int((1.0 - ph) * 140.0));
+            p.setBrush(Qt::NoBrush);
+            p.setPen(QPen(halo, UiFont::px(2)));
+            p.drawEllipse(dotC, rr, rr);
+        }
+
+        p.setPen(Qt::NoPen);
+        p.setBrush(skinDot(m_state));
+        p.drawEllipse(dotC, dotD / 2.0, dotD / 2.0);
+
+        // ---- 文字 ----
+        p.setPen(skinText(m_state));
+        p.drawText(QRect(padH + dotD + gap, 0, width() - padH - dotD - gap, height()),
+                   Qt::AlignVCenter | Qt::AlignLeft, stateText(m_state));
+    }
+
+private:
+    static QFont badgeFont()
+    {
+        // 自绘控件不走 QSS，字号档位得自己套：11px 基准 × 当前档位。
+        QFont f;
+        f.setPixelSize(UiFont::px(11));
+        f.setWeight(QFont::DemiBold);   // 小字号加半粗，两个字才立得住
+        return f;
+    }
+
+    static QString stateText(State s)
+    {
+        switch (s)
+        {
+        case State::Online:  return QStringLiteral("在线");
+        case State::Offline: return QStringLiteral("离线");
+        case State::Checking: break;
+        }
+        return QStringLiteral("检测中…");
+    }
+
+    static QString stateTip(State s)
+    {
+        switch (s)
+        {
+        case State::Online:  return QStringLiteral("网络连接正常");
+        case State::Offline: return QStringLiteral("无网络连接，正在自动重试…");
+        case State::Checking: break;
+        }
+        return QStringLiteral("正在检测网络…");
+    }
+
+    // 配色跟面板现有元素对齐：离线红取 × 按钮 hover 的 #A32D2D，
+    // 灰取标题的 #888780 一族；胶囊用浅色实底，压得住背景图。
+    static QColor skinFill(State s)
+    {
+        switch (s)
+        {
+        case State::Online:  return QColor(226, 244, 232, 215);
+        case State::Offline: return QColor(252, 235, 235, 215);   // closeBtn hover 同色 #FCEBEB
+        case State::Checking: break;
+        }
+        return QColor(238, 236, 230, 215);
+    }
+
+    static QColor skinBorder(State s)
+    {
+        switch (s)
+        {
+        case State::Online:  return QColor(96, 190, 134, 210);
+        case State::Offline: return QColor(224, 106, 106, 210);
+        case State::Checking: break;
+        }
+        return QColor(170, 168, 158, 210);
+    }
+
+    static QColor skinDot(State s)
+    {
+        switch (s)
+        {
+        case State::Online:  return QColor(0x2E, 0xA4, 0x5C);
+        case State::Offline: return QColor(0xD6, 0x45, 0x45);
+        case State::Checking: break;
+        }
+        return QColor(0x8F, 0x8E, 0x86);
+    }
+
+    static QColor skinText(State s)
+    {
+        switch (s)
+        {
+        case State::Online:  return QColor(0x1D, 0x7A, 0x44);
+        case State::Offline: return QColor(0xA3, 0x2D, 0x2D);     // closeBtn hover 同色
+        case State::Checking: break;
+        }
+        return QColor(0x6B, 0x6A, 0x64);
+    }
+
+    QVariantAnimation* m_pulse = nullptr;
+    State              m_state = State::Checking;
+};
+
+// =============================================================================
+//  网络探测 —— 徽章的数据源
+//
+//  ★ 为什么自己发请求，不用 QNetworkInformation ★
+//    那套 API 只反映"操作系统觉得有没有网"，还得带上对应的平台插件 DLL 一起
+//    部署；而且测不出"Wi-Fi 连着但路由器没外网"这种最常见的假在线。
+//    本程序里真正吃网络的就是音乐一条线（联网搜索、在线播放、下载，
+//    见 OnlineMusic / AudioPlayer）；聊天（预设台词）和每日图片（本地
+//    resources/daily_image）都是离线功能，不依赖这颗徽章。
+//    "能不能上网"就用"真的去连一次"来回答 —— 徽章说在线，
+//    至少音乐搜索/在线播放此刻是能用的。
+//
+//  节奏：在线时 10s 一轮；一旦判离线，收紧到 5s 一轮，恢复能快点被看到。
+//  一轮按顺序试下面的端点，任一成功即在线（都是连通性检查专用地址，响应只有
+//  几十字节，不带任何内容，流量可忽略）。单次请求 5s 超时，全失败判离线。
+//  探测全程异步：构造里发出第一发就返回，不拖面板的启动。
+// =============================================================================
+class NetWatcher : public QObject
+{
+public:
+    explicit NetWatcher(std::function<void(bool)> onResult, QObject* parent = nullptr)
+        : QObject(parent), m_onResult(std::move(onResult))
+    {
+        m_nam = new QNetworkAccessManager(this);
+        m_retry.setSingleShot(true);
+        connect(&m_retry, &QTimer::timeout, this, [this] { probe(); });
+        QTimer::singleShot(250, this, [this] { probe(); });   // 等事件循环转起来再发第一轮
+    }
+
+private:
+    void probe()
+    {
+        m_next = 0;
+        sendOne();
+    }
+
+    void sendOne()
+    {
+        if (m_next >= m_urls.count())
+        {
+            report(false);      // 几个端点都不通，真离线
+            return;
+        }
+
+        QNetworkRequest req(QUrl(m_urls.at(m_next++)));
+        req.setTransferTimeout(5000);   // 卡住的连接 5s 掐掉，别拖住下一轮
+        req.setAttribute(QNetworkRequest::CacheLoadControlAttribute,
+                         QNetworkRequest::AlwaysNetwork);   // 探测就别吃缓存了
+        QNetworkReply* reply = m_nam->get(req);
+        connect(reply, &QNetworkReply::finished, this, [this, reply] { onOneDone(reply); });
+    }
+
+    void onOneDone(QNetworkReply* reply)
+    {
+        reply->deleteLater();
+        const int code = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        if (reply->error() == QNetworkReply::NoError && code >= 200 && code < 400)
+        {
+            report(true);
+            return;
+        }
+        sendOne();      // 这个端点不行，换下一个
+    }
+
+    void report(bool online)
+    {
+        if (m_onResult)
+            m_onResult(online);
+        m_retry.start(online ? 10000 : 5000);
+    }
+
+    QNetworkAccessManager*    m_nam      = nullptr;
+    QTimer                    m_retry;
+    std::function<void(bool)> m_onResult;
+    int                       m_next     = 0;
+
+    // 主用 MIUI 的 generate_204（国内快、响应 204 无正文），
+    // 备用 Windows 自带的 NCSI 探测地址（微软自家连网检测用的那条）。
+    const QStringList m_urls = {
+        QStringLiteral("https://connect.rom.miui.com/generate_204"),
+        QStringLiteral("http://www.msftconnecttest.com/connecttest.txt"),
+    };
+};
 
 MainPanel::MainPanel(QWidget* parent) : QWidget(parent)
 {
@@ -90,7 +384,20 @@ MainPanel::MainPanel(QWidget* parent) : QWidget(parent)
     auto* topTitle = new QLabel(QStringLiteral("PetPal"), m_topBar);
     topTitle->setObjectName(QStringLiteral("topTitle"));
     topLay->addWidget(topTitle);
+
+    // 网络状态徽章：标题右边的绿/红小胶囊（见上面 NetBadge 的说明）。
+    // 数据来自下面的 NetWatcher —— 真·发一次请求来判定在线/离线。
+    m_netBadge = new NetBadge(m_topBar);
+    topLay->addWidget(m_netBadge);
+
     topLay->addStretch();
+
+    new NetWatcher([this](bool online)
+    {
+        if (m_netBadge)
+            m_netBadge->setState(online ? NetBadge::State::Online
+                                        : NetBadge::State::Offline);
+    }, this);
 
     // 右侧三个窗控按钮，从右往左：关闭、放大/还原、最小化 —— 和 Windows 标题栏同序，
     // 用户不用重新学。都是 22x22 的圆形按钮，只是 hover 配色不同。
@@ -176,6 +483,10 @@ void MainPanel::applyUiScale()
     applyStyle();
 
     m_nav->setFixedWidth(UiFont::px(BASE_NAV_W));
+
+    // 徽章是自绘的，不吃 QSS 的字号改写，尺寸得自己跟着档位走
+    if (m_netBadge)
+        m_netBadge->refreshScale();
 
     // 最小尺寸按档位放大，但**不能超过屏幕** —— 屏幕不够大时宁可让内容挤一点，
     // 也不能把窗口撑到屏幕外面去（那样连标题栏都点不到了）。
@@ -350,6 +661,23 @@ void MainPanel::showCenteredIn(const QRect& screenRect)
     show();
     raise();
     activateWindow();
+}
+
+// =============================================================================
+//  关闭 = 藏起来，绝不退出程序
+//
+//  ★ 为什么必须拦 ★ 无边框窗口补了 WS_MINIMIZEBOX 之后，任务栏图标右键
+//  菜单里的「关闭窗口」、Alt+F4 都会把真正的关闭命令（WM_CLOSE / SC_CLOSE）
+//  送进面板。放任默认处理的话面板会被 close() —— 而桌宠是 Qt::Tool 小窗，
+//  拦不住"最后一个主窗口关闭"的退出逻辑，整个程序跟着退出：用户只是想关个
+//  面板，桌宠也一起没了（用户明确要求两者互不相干，2026-10-01）。
+//  这里一律 ignore + hide()，和右上角 × 完全同路。真正的退出走托盘/右键
+//  菜单的「退出」（QApplication::quit，不经过 closeEvent，不受影响）。
+// =============================================================================
+void MainPanel::closeEvent(QCloseEvent* event)
+{
+    event->ignore();
+    hide();
 }
 
 // =============================================================================

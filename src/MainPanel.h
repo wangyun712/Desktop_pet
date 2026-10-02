@@ -20,6 +20,7 @@
 class QListWidget;
 class QStackedWidget;
 class QPushButton;
+class NetBadge;     // 顶部条的网络状态徽章（实现在 MainPanel.cpp 里，仅该文件使用）
 
 class MainPanel : public QWidget
 {
@@ -62,6 +63,9 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    // ★ 面板的"关闭"只是藏起来，绝不退出程序 ★（用户明确要求与桌宠互不相干）
+    //   任务栏图标右键菜单的「关闭窗口」、Alt+F4 走的都是这里。
+    void closeEvent(QCloseEvent* event) override;
 
 private:
     static constexpr int TOP_BAR_H = 38;    // 顶部条高度：既是标题栏，也是拖动把手
@@ -75,6 +79,7 @@ private:
     QPushButton*    m_minBtn   = nullptr;   // 最小化
     QPushButton*    m_maxBtn   = nullptr;   // 放大 / 还原
     QPushButton*    m_closeBtn = nullptr;   // 关闭
+    NetBadge*       m_netBadge = nullptr;   // "PetPal" 右边的网络状态胶囊（绿=在线，红=离线）
 
     QPoint m_dragOffset;                    // 拖动时鼠标相对窗口左上角的偏移
     bool   m_dragging = false;

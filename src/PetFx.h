@@ -18,6 +18,7 @@
 // =============================================================================
 
 #include <QPointer>
+#include <QVector>
 #include <QWidget>
 #include <QList>
 #include <QPointF>
@@ -34,6 +35,11 @@ public:
     void burstHearts(int count);       // 从桌宠头顶散开 n 颗小心心
     void setSleeping(bool on);         // 睡觉期间周期性飘 Zzz（醒来自动停）
     void petMoved();                   // 桌宠动过：重新覆盖（内部有短路）
+
+    // 音频频谱（桌宠脚下）：PlayerPage 30fps 喂 16 个频段能量 [0,1]。
+    // 全零时自然收工；桌宠不可见时这里直接不画（柱子不会飘在桌面上）。
+    void setSpectrum(const QVector<float>& bands);
+    void stopSpectrum();               // 桌宠藏进托盘时叫一声，柱子立刻归零
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -63,4 +69,6 @@ private:
     QTimer*           m_tickTimer = nullptr;   // 33ms 推进
     QTimer*           m_zzzTimer  = nullptr;   // 睡觉时 ~1.1s 飘一个 Z
     bool              m_sleeping  = false;
+    QVector<float>    m_spec;          // 频段能量（空 = 频谱没开）
+    bool              m_specAlive = false; // 这一拍频谱有活（有柱子要画）
 };

@@ -34,10 +34,14 @@
 #include <QPixmap>
 #include <QSet>
 #include <QSize>
+#include <QByteArray>
+
+#include "PixivFetcher.h"
 
 class QLabel;
 class QPushButton;
 class QTimer;
+class QButtonGroup;
 
 class DailyImagePage : public QWidget
 {
@@ -70,6 +74,13 @@ private slots:
     void onShuffle();               // 「换一换」：随机换一张，并把结果记进存档
 
 private:
+    // ---- 联网（Pixiv）标签 ----
+    void setOnlineMode(bool on);    // 本地 / 联网 切换
+    void beginOnlineSearch();       // 随机页码搜一批（结果乱序入池）
+    void prefetchNext();            // 从池里取下一个：详情 → 大图字节 → 进缓存
+    void showNextOnline();          // 从缓存弹一张显示；缓存空则催补货
+    void applyOnlineImage();        // 把当前联网图放进显示管线（走 m_source 那套缩放）
+
     void           applyStyle();            // 整页样式表（构造时和改字号时共用）
     QString        pickTodayImage();        // 今天的图（今天已经挑过就沿用，否则随机）
     QString        pickUnseen(const QStringList& files, const QString& currentName);
@@ -108,4 +119,32 @@ private:
     //   删掉的图自然消失，**新加的图因为不在集合里，会被优先抽中**。
     //   只在内存里，showEvent 里重置（见 .cpp）。
     QSet<QString> m_seenThisOpen;
+
+    // ---- 联网（Pixiv）标签的状态 ----
+    //  缓存 = 已拉好字节的图，显示零等待；「换一换」弹一张、后台自动补一张。
+    //  池 = 一次搜索的结果（已乱序）；用完随机换一页重搜。
+    //  ★ 全部内存态、不落盘 ★ —— 联网是"看图"功能，没有"每日固定一张"的语义。
+    QButtonGroup* m_modeGroup  = nullptr;   // 本地 / 联网 互斥
+    QPushButton*  m_localTab   = nullptr;
+    QPushButton*  m_onlineTab  = nullptr;
+    bool          m_onlineMode  = false;    // 当前是不是联网标签
+    bool          m_onlineTried = false;    // 本次运行是否已经搜过（切回不再重搜）
+    bool          m_fetching    = false;    // 有一张图正在取（防重入）
+    bool          m_awaitShow   = false;    // 用户点了换一换但缓存还空 → 到货自动上屏
+    int           m_failRun     = 0;        // 连续失败计数（≥3 才报错，偶发失败静默跳过）
+    QVector<PixivFetcher::Illust> m_onlinePool;   // 搜索结果（已乱序）
+    int           m_poolPos    = 0;          // 池消费到哪了
+    struct OnlinePic
+    {
+        PixivFetcher::Illust info;
+        QByteArray  bytes;      // 原始字节（双击保存用）
+        QPixmap     pm;         // 解码结果（显示用）
+    };
+    QVector<OnlinePic> m_cache;          // 预取好的图
+    QByteArray  m_onlineBytes;           // 当前显示这张的原始字节（双击保存用）
+    QString     m_onlineId;              // 当前显示这张的作品 ID
+    QString     m_onlineTitle;           // 当前显示这张的标题（底栏文字用）
+    QString     m_onlineArtist;          // 当前显示这张的画师（底栏文字用）
+    QPixmap     m_onlineSource;          // 联网图的"显示缓存"（切标签往返不丢）
+    QSize       m_onlineSize;            // 联网图原图尺寸（底栏文字用）
 };

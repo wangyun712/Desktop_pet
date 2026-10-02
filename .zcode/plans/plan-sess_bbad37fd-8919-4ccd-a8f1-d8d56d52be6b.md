@@ -1,25 +1,27 @@
-## 实施计划:B 站音频转存 FLAC(不抓歌词)
+## 实施计划:每日图片加"联网(Pixiv)"标签页
 
-### 1. 引入 libFLAC 静态库
-- 下载 xiph/flac 官方源码(1.5.x,BSD 协议)到 `third_party/libflac/`,只保留 `include/`、`src/libFLAC/` 和 `LICENSE`。
-- `CMakeLists.txt` 新增 `add_library(flac STATIC ...)`:编译 `src/libFLAC/*.c`(约 28 个文件,不含 ogg 依赖,定义 `FLAC__NO_DLL`),头文件路径加 `include/`。不产新 DLL,pack.bat 无需改动。
-- 新增的 `src/FlacEncode.h/.cpp` 按 CMakeLists 现有维护规则同步进源文件 / PETPAL_HEADERS 列表(169-220 行)。
+### 1. 新增 src/PixivFetcher.{h,cpp}(照 OnlineMusic 的命名空间+回调风格)
+- search(keyword, page, ctx, cb):GET https://www.pixiv.net/ajax/search/artworks/{关键词URL编码}?s_mode=tag&type=illust&mode=safe&ai_type=1&wlt=3000&hlt=3000&p={page}(参数与你给的搜索头一一对应;浏览器 UA + Referer: https://www.pixiv.net/)。解析 body.illustManga[] → {illustId, title, userName} 列表(QJson 链式取值照 OnlineMusic 先例)。
+- fetchIllust(id, ctx, cb):GET /ajax/illust/{id} → urls.regular(master1200 清晰度,面板显示与保存都够用)+ pageCount。
+- fetchBytes(url, ctx, cb):GET 图片字节(i.pximg.net 必须带 Referer,不然 403)→ QByteArray。
+- 三个函数都带 QObject* ctx 宿主守卫(照 hostAlive 先例,宿主析构丢弃回调)。
 
-### 2. 新增 FlacEncode 封装 — `src/FlacEncode.{h,cpp}`
-- `bool encode(pcm16, channels, sampleRate, title, artist, outPath, err)`:用 libFLAC C API(stream_encoder,`init_file` 直接写文件,压缩级别 5),16bit 交错 PCM 分块 `process_interleaved`;同时把 TITLE/ARTIST 写进 VORBIS_COMMENT(`TrackMeta::parseFlac` 已支持读,曲库显示更准)。不写歌词标签。
+### 2. DailyImagePage 改造(本地标签完全不动)
+- 标题行:「本地」/「联网」两个 checkable 按钮(QButtonGroup 互斥,照 PlayerPage"网易云/B站"先例),样式加进 DailyImagePage::applyStyle()(playerFav 同套色值,objectName=dailyTab 防串页);右侧"换一换"按钮两个标签共用。本地模式下原进度文案、"本次还剩 N 张"逻辑原样保留。
+- 联网模式:
+  - 首次切到联网 → 随机页码搜索(结果乱序)→ 依次取图:先 fetchIllust 拿大图地址,再 fetchBytes 拉字节;后台预取 5 张进内存缓存,显示时零等待;每消费一张自动补拉一张。
+  - 取图中 caption 显示"正在从 Pixiv 取图…";失败(403/超时——需要能访问 pixiv,Qt 走系统代理)显示原因 + "点换一换重试"。
+  - 底栏 caption:标题 · 画师 · 双击保存到本地图库并打开。
+- 双击(联网模式):把缓存的图片字节存为 resources/daily_image/pixiv_{illustId}_p{页}.jpg(已存在则跳过下载直接开)→ QDesktopServices::openUrl 系统工具打开。落盘的图自动进入本地池(现有扫描机制),标题行进度随之变化。
+- 自检(persistent=false)不触网,行为不变;describe 提示联网标签仅运行期有效。
 
-### 3. 改造 MfDecode — `src/MfDecode.{h,cpp}`
-- 现有解码循环(MfDecode.cpp:98-127)抽成同步内核 `decodePcm()`;删除 WAV 头打包段(134-156 行)和 putU32/putU16。
-- 新增入口 `decodeToFlacAsync(QObject* ctx, input, outputFlac, title, artist, cb)`:在 `std::thread` 里跑「解码 → libFLAC 编码」,完成后用 `QMetaObject::invokeMethod(ctx, ...)`(AudioPlayer.cpp:808 已有同款写法)把回调派回主线程,ctx 失效自动丢弃——转码移出主线程,避免 UI 卡顿。
-- 头文件注释同步更新(「解成 FLAC,miniaudio 原生播放」)。
+### 3. 工程登记
+- CMakeLists.txt 三处按维护规则登记新文件(PROJECT_SOURCES / PETPAL_HEADERS / OBJECT_DEPENDS)。
+- pack.bat 无需改动(daily_image 目录本就随包发放,联网下载的图落这里)。
 
-### 4. PlayerPage 接线 — `src/PlayerPage.cpp`
-B 站分支(2868-2919 行):
-- 输出 `base + ".flac"`;缓存命中改为先查 `.flac`、再兼容查老 `.wav`(已收藏的歌不重新下载)。
-- 下载完 m4a 后设行标签「转码中」→ `decodeToFlacAsync` → 回调里删中间产物、`playLocalWav(it, flacPath, ...)`。
-- `startDl` 里遗留的 m4s 分支(2782-2797 行)同步改为 FLAC 输出,保持一致。
-- `playLocalWav` 逻辑不动(miniaudio 直接播 FLAC;TrackMeta 自动读 FLAC 时长与 TITLE/ARTIST 标签)。
+### 4. 验证
+- 手动:切联网标签出图 → 换一换连续换 5+ 张 → 双击保存并打开 → 本地标签"换一换"能抽到刚存的图;断网/代理关掉时给明确失败提示且本地标签不受影响。
+- --selftest 回归(每日图片节仍是本地只读断言)。
 
-### 5. 验证
-- CMake 构建(链接 flac 目标)通过。
-- 运行检查:B 站搜歌双击 → 储存盘出现 `.flac`、正常播放、曲库显示标题/歌手;再点同首 → 缓存命中不重新下载;老 `.wav` 收藏仍可播。
+### 边界说明
+搜索关键词先写死为"洛天依 -AI生成 -涩"(safe 分级 + 排除 AI);做成设置可改的关键词属于后续增强,这轮不做。Pixiv 从数据中心访问是 403(已实测),用户机器走浏览器/系统代理可达即可用;失败路径有明确提示。

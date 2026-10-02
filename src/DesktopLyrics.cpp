@@ -150,15 +150,21 @@ void DesktopLyrics::updateWidth()
 // =============================================================================
 //  喂歌词 / 播放状态
 // =============================================================================
-void DesktopLyrics::setLine(const QString& current, const QString& next)
+void DesktopLyrics::setLine(const QString& current, const QString& next, float progress)
 {
-    // 文本没变就是空操作 —— PlayerPage 那边 200ms 轮询一次，
-    // 每帧都重绘一遍是白白耗电。
-    if (m_cur == current && m_next == next)
+    // 进度量化到 1/128：positionChanged 200ms 一拍，量化后才不会"每拍都白刷
+    // 一遍"；反过来文本没变但进度变了也必须继续往下走 —— 卡拉OK渐变靠的就是
+    // 同一条歌词反复喂进来。
+    float pq = progress;
+    if (pq >= 0.0f)
+        pq = qBound(0.0f, qRound(pq * 128.0f) / 128.0f, 1.0f);
+
+    if (m_cur == current && m_next == next && m_progress == pq)
         return;
 
-    m_cur  = current;
-    m_next = next;
+    m_cur      = current;
+    m_next     = next;
+    m_progress = pq;
 
     if (m_cur.isEmpty())
     {
@@ -256,13 +262,31 @@ void DesktopLyrics::paintEvent(QPaintEvent* event)
         const QFont f = lineFont(kCurFontPx);
         const QFontMetrics fm(f);
         const QString text = fm.elidedText(m_cur, Qt::ElideRight, maxTextW);
+        const int textX = (width() - fm.horizontalAdvance(text)) / 2;
         QPainterPath path;
-        path.addText((width() - fm.horizontalAdvance(text)) / 2,
-                     y + fm.ascent(), f, text);
-        // 深色描边垫底、主题强调色填充盖面 —— 先描后填，描边只露外面半圈
+        path.addText(textX, y + fm.ascent(), f, text);
+        // 深色描边垫底、填充盖面 —— 先描后填，描边只露外面半圈
         p.strokePath(path, QPen(QColor(0, 0, 0, 170), 4.0,
                                 Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-        p.fillPath(path, UiTheme::color(UiTheme::Accent));
+        if (m_progress >= 0.0f)
+        {
+            // ★ 卡拉OK渐变 ★ 整行先铺"未唱"浅色（同下一行），已唱部分按
+            // 进度裁出矩形叠填强调色 —— 渐变界随时间从左往右扫过去。
+            p.fillPath(path, QColor(0xE6, 0xE4, 0xDC));
+            const int sungW = int(fm.horizontalAdvance(text) * m_progress);
+            if (sungW > 0)
+            {
+                p.save();
+                p.setClipRect(QRect(textX, 0, sungW, height()));
+                p.fillPath(path, UiTheme::color(UiTheme::Accent));
+                p.restore();
+            }
+        }
+        else
+        {
+            // 无进度（无时间戳行 / 占位文本）：整句强调色，旧行为
+            p.fillPath(path, UiTheme::color(UiTheme::Accent));
+        }
     }
 
     y += rowHeight(kCurFontPx) + kRowGap;

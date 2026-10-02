@@ -48,7 +48,9 @@ public:
 
     // 喂歌词。current 为空 = 没东西可显示（开关关了/没歌）→ 整窗隐藏；
     // 喂"暂无歌词"这类占位文本时窗口照常显示。
-    void setLine(const QString& current, const QString& next);
+    // progress = 当前行已唱比例 [0,1]（卡拉OK渐变，见 paintEvent）；<0 = 不渐变
+    // （无时间戳的纯文本行/还没唱到第一句）。
+    void setLine(const QString& current, const QString& next, float progress = -1.0f);
 
     // 播放键图标状态（播放中显示暂停图标，否则显示播放图标）。
     void setPlaying(bool playing);
@@ -91,6 +93,7 @@ private:
 
     QString m_cur;             // 当前行（空 = 隐藏）
     QString m_next;            // 下一行（可能为空：唱到最后一句了）
+    float   m_progress = -1.0f;// 当前行已唱比例（量化后 1/128 步进；<0 = 不渐变）
     bool    m_dragging = false;
     QPoint  m_dragOffset;
 

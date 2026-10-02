@@ -62,6 +62,11 @@ public:
     void setVolumePercent(int percent);   // 0~100
     int  volumePercent() const;
 
+    // 频谱取样：拉最近 maxFrames 帧单声道 f32（音频回调里顺手降混写进环形
+    // 缓冲的那份）。返回实际拿到的帧数；没在播时是旧数据/静音，调用方按
+    // isPlaying 自行衰减。★ 只能在主线程调（和 positionMs 同一条纪律）★
+    int readSpectrum(float* dst, int maxFrames);
+
     // 自检用：引擎起没起来、走的哪个后端、设备叫什么。纯只读。
     QString describe() const;
 

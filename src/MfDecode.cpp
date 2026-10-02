@@ -4,6 +4,7 @@
 
 #include "FlacEncode.h"
 
+#include <QCoreApplication>
 #include <QFile>
 #include <QMetaObject>
 #include <QPointer>
@@ -83,8 +84,14 @@ bool decodePcm(const QString& input, DecodedPcm& out, QString* errorOut)
         MFShutdown();
         return fail(QStringLiteral("读不到音频流格式（这条资源可能没有音频轨）"));
     }
-    native->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &out.channels);
-    native->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &out.sampleRate);
+    // ★ 两个字段必须读到 ★ 读失败会静默落在默认值 2ch/48kHz 上,
+    // 把非常规流编成变速变调的废文件 —— 不如明确报"无法播放"
+    if (FAILED(native->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &out.channels))
+        || FAILED(native->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &out.sampleRate)))
+    {
+        MFShutdown();
+        return fail(QStringLiteral("音频流缺少声道/采样率信息"));
+    }
     if (out.channels == 0 || out.sampleRate == 0)
     {
         MFShutdown();
@@ -183,10 +190,17 @@ void decodeToFlacAsync(QObject* ctx, const QString& input, const QString& output
         if (needCoUninit)
             CoUninitialize();
 
-        if (guard)
-            QMetaObject::invokeMethod(guard.data(),
-                [ok, err, cb = std::move(cb)] { cb(ok, err); },
-                Qt::QueuedConnection);
+        // 派回主线程。上下文用 qApp（活到进程结束）：invokeMethod 内部要
+        // postEvent 解引用上下文,若直接用宿主指针,"判活通过之后、postEvent
+        // 之前宿主恰好析构"的纳秒级 TOCTOU 就是崩溃;真宿主的判活放进
+        // lambda 里,窗口没了就丢弃结果。
+        QPointer<QObject> g = guard.data();
+        QMetaObject::invokeMethod(QCoreApplication::instance(),
+            [g, ok, err, cb = std::move(cb)] {
+                if (g)
+                    cb(ok, err);
+            },
+            Qt::QueuedConnection);
     }).detach();
 }
 

@@ -207,6 +207,15 @@ struct AudioShared
     std::atomic<bool>      seekPending{ false };
     std::atomic<bool>      reachedEnd{ false };
     std::atomic<float>     volume{ 1.0f };      // 线性 0~1
+
+    // ---- 频谱取样环形缓冲（音频线程只写、主线程只读，无锁）----
+    // 单声道 f32。游标是"累计写入帧数"（单调递增，取模定位）：写端 release
+    // 递增，读端 acquire 取快照 —— 经典 SPSC，写读各自单线程，天然安全。
+    // ★ 不播放时回调停发，缓冲里是旧数据：读取方（PlayerPage）按 isPlaying
+    //   自行衰减到零，这里不管生命周期 ★
+    static constexpr int kSpecFrames = 2048;    // ≈42ms @48kHz，够算 1024 点 FFT
+    float                  specMono[kSpecFrames]{};
+    std::atomic<ma_uint64> specWritten{ 0 };
 };
 
 // -----------------------------------------------------------------------------
@@ -258,6 +267,24 @@ void onDeviceData(ma_device* pDevice, void* pOutput, const void* /*pInput*/, ma_
         const size_t n = size_t(frameCount) * kChannels;
         for (size_t i = 0; i < n; ++i)
             f[i] *= v;
+    }
+
+    // ---- ④ 频谱取样：降混单声道塞进环形缓冲（纯拷贝 + 原子递增，无锁无分配）----
+    // 放的是音量乘完之后的样本 —— 柱子高度跟用户耳朵听到的响度一致。
+    // 不足帧数的静音填充也要进缓冲：不播/播完时频谱才能"看见"安静。
+    // 万一某后端的周期超过缓冲容量（当前 10ms≈480 帧，远小于 2048，到不了），
+    // 只保留**最新的** cap 帧 —— 游标照样前进 frameCount，语义才对得上。
+    {
+        const float* f = static_cast<const float*>(pOutput);
+        const int cap    = AudioShared::kSpecFrames;
+        const int n      = int(qMin<ma_uint64>(frameCount, ma_uint64(cap)));
+        const int first  = int(frameCount - ma_uint64(n));   // 超容量时跳过最旧的
+        const int start  = int(sh->specWritten.load(std::memory_order_relaxed) % ma_uint64(cap));
+        for (int i = 0; i < n; ++i)
+            sh->specMono[(start + i) % cap] =
+                0.5f * (f[size_t(first + i) * kChannels] + f[size_t(first + i) * kChannels + 1]);
+        // release：主线程读到新游标时，这批样本必然已经可见
+        sh->specWritten.fetch_add(ma_uint64(frameCount), std::memory_order_release);
     }
 
     sh->playedFrames.fetch_add(got);
@@ -402,6 +429,7 @@ public:
             m_read     = target;
             m_finished = false;
             m_failed   = false;
+            m_bufGen.fetch_add(1, std::memory_order_release);   // 旧偏移的迟到数据作废
             if (m_restart)
                 m_restart(target);         // handler 内部排回主线程（见上）
         }
@@ -444,17 +472,22 @@ private:
             req.setRawHeader(it.key().toUtf8(), it.value().toUtf8());
 
         m_reply = nam().get(req);
+        m_replyGen = m_bufGen.load(std::memory_order_acquire);   // 本批数据的代数
         QObject::connect(m_reply, &QNetworkReply::readyRead, m_reply, [this] {
-            const QVariant cl = m_reply->header(QNetworkRequest::ContentLengthHeader);
             QMutexLocker l(&m_mtx);
+            if (m_replyGen != m_bufGen.load(std::memory_order_acquire))
+                return;                        // ★ seek 已重置缓冲:旧偏移的迟到数据整段丢弃 ★
+            const QVariant cl = m_reply->header(QNetworkRequest::ContentLengthHeader);
             if (m_total < 0 && cl.isValid())
                 m_total = m_base + cl.toLongLong();
             m_buf += m_reply->readAll();
             m_cv.wakeAll();
         });
         QObject::connect(m_reply, &QNetworkReply::finished, m_reply, [this] {
-            const QVariant cl = m_reply->header(QNetworkRequest::ContentLengthHeader);
             QMutexLocker l(&m_mtx);
+            if (m_replyGen != m_bufGen.load(std::memory_order_acquire))
+                return;                        // 旧 reply 的收尾不碰新缓冲的账本
+            const QVariant cl = m_reply->header(QNetworkRequest::ContentLengthHeader);
             if (m_total < 0 && cl.isValid())
                 m_total = m_base + cl.toLongLong();
             m_finished = true;
@@ -483,6 +516,14 @@ private:
     bool           m_finished = false;
     bool           m_failed   = false;
     bool           m_stopped  = false;
+
+    // ★ 缓冲"代数"★ seek 出缓冲区时（音频线程）会清空 m_buf、改 m_base ——
+    // 旧 reply 已经排到主线程队列里的 readyRead 若晚于这次清空才执行，
+    // 会把旧文件偏移的字节追加进以新 base 起算的缓冲（解码器瞬间失步出噪声）。
+    // seek 时代数 +1；readyRead 持锁核对代数，不一致就整段丢弃。
+    // m_bufGen 跨线程（音频 +1 / 主线程读），m_replyGen 只在主线程。
+    std::atomic<quint64> m_bufGen{ 0 };
+    quint64              m_replyGen = 0;
 
     std::function<void(qint64)> m_restart; // seek 出缓冲区 → 主线程 Range 续传
 
@@ -664,11 +705,24 @@ AudioPlayer::~AudioPlayer()
     if (!m_impl)
         return;
 
-    // 顺序不能乱：先停设备（等音频线程退出），再放 decoder，最后才是 context / log
+    // 收尾各阶段的耗时打点：退出卡顿（"按退出好几秒才结束"）排查看这一行
+    QElapsedTimer dtorClock;
+    dtorClock.start();
+
+    // 顺序不能乱：★先把在线流的喂数据器叫停★ 音频回调可能正卡在"等网络
+    // 补数据"的条件变量上（最长睡 10 秒）—— 不先唤醒它，下面 ma_device_uninit
+    // 等回调返回就会跟着吊住，用户按退出后进程在任务管理器里赖着不走的就是它。
+    // 然后停设备（等音频线程退出），再放 decoder，最后才是 context / log
+    if (m_impl->stream)
+    {
+        m_impl->stream->stop();
+        qDebug() << "[PetPal] 音频收尾·流停止" << dtorClock.restart() << "ms";
+    }
     if (m_impl->deviceReady)
     {
         ma_device_uninit(m_impl->device);      // 内部会 stop + join 线程
         m_impl->deviceReady = false;
+        qDebug() << "[PetPal] 音频收尾·设备释放" << dtorClock.restart() << "ms";
     }
     if (m_impl->shared.decoderReady.load())
     {
@@ -973,6 +1027,28 @@ void AudioPlayer::setVolumePercent(int percent)
 int AudioPlayer::volumePercent() const
 {
     return m_volumePercent;
+}
+
+// =============================================================================
+//  频谱取样：拉最近一段单声道样本（音频回调里写进环形缓冲的那份）
+//
+//  ★ 只能在主线程调（和 positionMs 同一条纪律）★ 读端单线程 + acquire
+//  游标，和写端 SPSC 配对，无锁。没在播时缓冲里是旧数据 —— 调用方按
+//  isPlaying 自行衰减，这里不管生命周期。
+// =============================================================================
+int AudioPlayer::readSpectrum(float* dst, int maxFrames)
+{
+    if (!m_impl || !dst || maxFrames <= 0)
+        return 0;
+
+    const AudioShared* sh = &m_impl->shared;
+    const int cap     = AudioShared::kSpecFrames;
+    const qint64 written = qint64(sh->specWritten.load(std::memory_order_acquire));
+    const int have = int(qMin<qint64>(written, qint64(cap)));
+    const int n    = qMin(have, maxFrames);
+    for (int i = 0; i < n; ++i)
+        dst[i] = sh->specMono[int((written - n + i) % cap)];
+    return n;
 }
 
 // =============================================================================

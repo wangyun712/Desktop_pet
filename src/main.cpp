@@ -25,6 +25,8 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QLocale>
 #include <QMessageBox>
 #include <QPainter>
@@ -33,9 +35,13 @@
 #include <QScreen>
 #include <QTextStream>
 #include <QTime>
+#include <QTimer>
+
+#include <cmath>
 
 #include "DesktopPet.h"
 #include "AnimationController.h"
+#include "AudioPlayer.h"
 #include "AffectionSystem.h"
 #include "AffectionPage.h"
 #include "SettingsPage.h"
@@ -50,13 +56,64 @@
 #include "PetSay.h"
 #include "OnlineMusic.h"
 
+static QString runWalkTrace()
+{
+    QString out;
+    out += QStringLiteral("===== 行走播放顺序自检 =====\r\n\r\n");
+
+    AnimationController anim;
+    if (!anim.loadAll())
+        return QStringLiteral("  [!!] 资源加载失败，无法验证行走时序\r\n");
+
+    anim.setState(PetState::WalkRight, /*force=*/true);
+
+    // 不跑事件循环，手动一帧一帧推，把每一步实际要画的那张图记下来，
+    // 直到序列成环 —— 「起步那一帧会不会在循环里又冒出来」一眼可见。
+    QStringList seen;
+    QStringList order;
+    int repeatAt = -1;
+    int step     = 0;
+    for (; step < 64; ++step)
+    {
+        const PetFrame f = anim.currentFrameRef();
+        const QString key = QStringLiteral("%1%2").arg(f.img)
+                                .arg(f.flip ? QStringLiteral("L") : QString());
+        const int hit = seen.indexOf(key);
+        if (hit >= 0)
+        {
+            repeatAt = hit;
+            break;
+        }
+        seen.append(key);
+        order += QStringLiteral("  第 %1 帧: 图 %2%3\r\n")
+                     .arg(step, 2).arg(f.img)
+                     .arg(f.flip ? QStringLiteral("（镜像）") : QString());
+        anim.stepFrame();
+    }
+
+    out += order.join(QString());
+
+    if (repeatAt < 0)
+    {
+        out += QStringLiteral("\r\n  [!!] 64 步之内没有成环 —— 行走帧序列有问题，检查 petWalkFrames\r\n");
+        return out;
+    }
+
+    out += QStringLiteral("\r\n  起步段 : %1 帧\r\n").arg(repeatAt);
+    out += QStringLiteral("  循环段 : %1 帧（第 %2 步与第 %3 步重合，开始成环）\r\n")
+               .arg(step - repeatAt).arg(step).arg(repeatAt);
+
+    // 关键判定：起步帧若混进循环段，画面会从"迈着腿的中间帧"直接跳回起步
+    // 姿势，步态看着一卡一卡 —— 这正是这条轨迹要抓的问题。
+    const bool startInLoop = seen.indexOf(seen.first(), repeatAt) >= 0;
+    out += startInLoop
+               ? QStringLiteral("  [!!] 起步帧混进了循环段 —— 检查 walk 的起步帧编排\r\n")
+               : QStringLiteral("  [OK] 起步段与循环段干净分离，步态时序正常\r\n");
+    return out;
+}
+
 // -----------------------------------------------------------------------------
-//  --walktrace：把行走的播放顺序逐帧打出来。
-//
-//  为什么需要它？
-//    「走路 = 起步 + 循环 + 收步」是时序逻辑，光看帧表看不出"起步那一帧会不会
-//    在循环里又冒出来"。这里不跑事件循环，只手动按 100ms 的节奏推进帧，
-//    把每一步实际要画的那张图记下来，顺序对不对一眼就能看出来。
+//  --walktrace：把行走的播放顺序逐帧打出来（实现见上 runWalkTrace）。
 //
 //  用法：PetPal.exe --walktrace
 //  结果：petpal_walktrace.txt（和 exe 同目录）
@@ -1000,6 +1057,23 @@ int main(int argc, char* argv[])
     if (QCoreApplication::arguments().contains(QStringLiteral("--selftest")))
         return runSelfTest();
 
+    // 行走播放顺序自检：手动推帧复现播放顺序（跑完就退出）
+    if (QCoreApplication::arguments().contains(QStringLiteral("--walktrace")))
+    {
+        const QDir exeDirW(QCoreApplication::applicationDirPath());
+        QFile f(exeDirW.filePath(QStringLiteral("petpal_walktrace.txt")));
+        if (f.open(QIODevice::WriteOnly | QIODevice::Text))
+        {
+            QTextStream ts(&f);
+            ts.setEncoding(QStringConverter::Utf8);
+            ts.setGenerateByteOrderMark(true);
+            ts << runWalkTrace();
+            ts.flush();
+            f.close();
+        }
+        return 0;
+    }
+
     // 下落时序自检：把重力轨迹逐步打出来（同样是跑完就退出）
     if (QCoreApplication::arguments().contains(QStringLiteral("--falltrace")))
     {
@@ -1034,6 +1108,103 @@ int main(int argc, char* argv[])
         return 0;
     }
 
+    // -----------------------------------------------------------------------------
+    //  --quittest：退出时序自检。
+    //  真启动完整桌宠（含音频设备、播放器页），还会**真的在放歌**（现场合成
+    //  一小段 WAV 载入播放，复现"听歌时点退出"的收尾路径），2 秒后调
+    //  QApplication::quit() —— 验证退出链上没有任何东西把进程吊住。
+    //  判定看进程存活时长：~3 秒内结束 = 正常；挂到 5 秒才被 quitApp 的保险丝
+    //  砍掉 = 退出链有 bug。用法：PetPal.exe --quittest
+    // -----------------------------------------------------------------------------
+    if (QCoreApplication::arguments().contains(QStringLiteral("--quittest")))
+    {
+        DesktopPet pet;
+        pet.start();
+
+        MainPanel panel;                       // 面板里要有播放器页（音频设备在它身上）
+        panel.setAttribute(Qt::WA_DontShowOnScreen, true);
+        auto* playerPage = new PlayerPage(&panel);
+        panel.addPage(QStringLiteral("播放器"), playerPage);
+        panel.show();
+        QApplication::processEvents();
+
+        // 合成 2 秒 440Hz 正弦 WAV → 载入 → 播放（复现"听歌时退出"）
+        const QString wavPath = QCoreApplication::applicationDirPath()
+                                + QStringLiteral("/quittest_tone.wav");
+        {
+            QFile f(wavPath);
+            if (f.open(QIODevice::WriteOnly))
+            {
+                const int sr = 44100;
+                const quint32 frames = quint32(sr) * 2, dataLen = frames * 4;
+                const auto u32 = [&f](quint32 v) {
+                    const char b[4] = { char(v), char(v >> 8), char(v >> 16), char(v >> 24) };
+                    f.write(b, 4);
+                };
+                const auto u16 = [&f](quint16 v) {
+                    const char b[2] = { char(v), char(v >> 8) };
+                    f.write(b, 2);
+                };
+                f.write("RIFF", 4); u32(36 + dataLen); f.write("WAVE", 4);
+                f.write("fmt ", 4); u32(16); u16(1); u16(2); u32(sr);
+                u32(sr * 4); u16(4); u16(16);
+                f.write("data", 4); u32(dataLen);
+                QByteArray pcm(int(dataLen), Qt::Uninitialized);
+                auto* s = reinterpret_cast<qint16*>(pcm.data());
+                for (quint32 i = 0; i < frames; ++i)
+                    for (int c = 0; c < 2; ++c)
+                        s[i * 2 + c] = qint16(9000.0 * std::sin(2.0 * 3.14159265358979
+                                                                * 440.0 * double(i) / sr));
+                f.write(pcm.constData(), pcm.size());
+            }
+        }
+        // 播放器放在内层作用域：exec 返回后它先析构、释放测试音的文件句柄，
+        // 外层才能把测试音删掉 —— 句柄没放时 Windows 上 remove 必然共享冲突失败
+        int rc = 0;
+        {
+            AudioPlayer bgPlayer;
+            QString loadErr;
+            if (bgPlayer.load(wavPath, &loadErr))
+                bgPlayer.play();
+            else
+                qWarning() << "[PetPal] --quittest:测试音载入失败" << loadErr;
+
+            QTimer::singleShot(2000, &app, [] { QApplication::quit(); });
+            rc = app.exec();
+        }                                  // ★ bgPlayer 在这里析构,句柄释放 ★
+        QFile::remove(wavPath);
+        return rc;
+    }
+
+    // =============================================================================
+    //  单实例保护（用户要求，2026-10-01）
+    //
+    //  第二次双击 exe 不该开出第二只桌宠：先用 QLocalSocket 连一把约定的名字，
+    //  连得上 = 已有实例在跑 —— 递一声"唤醒"过去，自己直接退。连不上（没有
+    //  实例）就作为第一实例 listen 起来，等后来者敲。
+    //    ★ 四个自检模式（--selftest 等）在上面已经 return，天然不受拦截 ★
+    //    ★ 第二实例必须在这里就 return：后面的 clearTempDir() 删的是第一实例
+    //      正在用的联网下载缓存，第二实例碰不得 ★
+    //    ★ listen 失败（权限/环境怪异）只记日志不退出：少个"唤回"功能，
+    //      好过整个程序起不来 ★
+    // =============================================================================
+    QLocalServer instanceServer;               // 活到 main 作用域结束（随程序退出）
+    {
+        QLocalSocket probe;
+        probe.connectToServer(QStringLiteral("PetPal-Instance"));
+        if (probe.waitForConnected(300))
+        {
+            probe.write("wake");
+            probe.waitForBytesWritten(300);
+            probe.disconnectFromServer();
+            return 0;
+        }
+        QLocalServer::removeServer(QStringLiteral("PetPal-Instance"));   // Windows 上是无害空操作
+        if (!instanceServer.listen(QStringLiteral("PetPal-Instance")))
+            qWarning() << "[PetPal] 单实例服务建立失败（不影响本实例运行）:"
+                       << instanceServer.errorString();
+    }
+
     // 桌宠对象建在栈上，生命周期就是 main 的作用域。
     // 它内部的窗口、定时器、两个控制器都会随它自动销毁，不会内存泄漏。
     DesktopPet pet;
@@ -1049,6 +1220,18 @@ int main(int argc, char* argv[])
     });
 
     pet.start();
+
+    // 后来者敲响单实例的门：把桌宠带回最前（藏着的从托盘恢复），不开面板。
+    // 事件循环 exec() 开始后 newConnection 才可能到，这里 connect 来得及。
+    QObject::connect(&instanceServer, &QLocalServer::newConnection, &pet, [&instanceServer, &pet]()
+    {
+        if (QLocalSocket* c = instanceServer.nextPendingConnection())
+        {
+            c->waitForReadyRead(100);          // 把那声"wake"读掉，内容不重要
+            c->disconnectFromServer();
+        }
+        pet.bringToFront();
+    });
 
     // exec() 会阻塞在这里跑 Qt 事件循环，直到有人调用 quit()。
     // 程序"活"着的整个过程都发生在这行里面。

@@ -152,7 +152,13 @@ bool encode(const QByteArray& pcm16, int channels, int sampleRate,
         return fail(err.isEmpty() ? QStringLiteral("FLAC 编码失败") : err);
     }
 
-    out.rename(outputFlac);              // 同目录改名，不存在跨盘问题
+    if (!out.rename(outputFlac))         // 同目录改名，不存在跨盘问题
+    {
+        // 改名失败（杀软短暂锁文件、磁盘满等）不能静默当成功 —— 不然调用方
+        // 会把一个不存在的路径入库，点播时才报错
+        out.remove();
+        return fail(QStringLiteral("FLAC 文件落盘失败（改名未成功）"));
+    }
     return true;
 }
 

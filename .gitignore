@@ -34,6 +34,7 @@ CMakeLists.txt.user*
 
 # ---- 工作区元数据（工作笔记 + 素材原始备份）----
 .workbuddy/
+.zcode/
 
 # ---- 个人图库，不进版本库 ----
 # 「每日图片」页读的是用户自己的图（resources/daily_image/），每人一份，
