@@ -30,6 +30,7 @@ struct Illust
     QString title;       // 作品标题
     QString userName;    // 画师
     int     pageCount = 1;
+    QString imageUrl;    // 图片直链（堆糖源搜索直出；Pixiv 由详情步骤填，池内初始为空）
 };
 
 using SearchCb = std::function<void(bool ok, const QVector<Illust>& list,

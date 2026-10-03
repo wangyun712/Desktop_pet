@@ -2,30 +2,22 @@
 // =============================================================================
 //  DailyImagePage —— 主面板里的「每日图片」页
 //
-//  做三件事：
-//    ① 挑图：同一天内固定同一张，跨天重新挑（不会跟昨天重复）
-//    ② 显示：等比缩放到页面里，不裁不拉变形
-//    ③ 双击：交给系统看图工具打开原图
+//  三个标签，各自独立：
+//    · 本地  —— 原有功能：resources/daily_image 里"每日固定一张"，换一换不重复
+//    · Pixiv —— 从 Pixiv 搜索取图（safe 分级 + 排除 AI，见 PixivFetcher）
+//    · 堆糖  —— 从堆糖搜索取图（卡片即内容图，没有"封面 ≠ 内容"的问题）
+//  每个联网标签有自己独立的池/缓存/当前图（m_online[0/1]），互不串。
 //
-//  ★ 「换一换」优先给没看过的（2026-09-23 改）★
-//    原先是纯随机，于是连点几次很可能又抽到看过的那张，观感就是"没换"。
-//    现在维护一个"**本次打开这一页**已经看过的图"集合（m_seenThisOpen）：
+//  ★ 本地标签：「换一换」优先给没看过的（2026-09-23 改）★
+//    维护一个"**本次打开这一页**已经看过的图"集合（m_seenThisOpen）：
 //    挑图时优先从没见过的那堆里抽，14 次之内不会重复。
-//    ★ 这个集合**只在内存里、不落盘**，每次切到这一页（showEvent）都重置。
-//      用户要的就是"打开看着的时候不重复"，不需要跨次记忆 —— 落盘反而会
-//      引入存档格式变更（新版本写进去的键老版本读不懂）这类麻烦。
-//    ★ 重置时**不是清成空**，而是置成"只剩屏幕上那张"。清空的话，屏幕上明明
-//      还挂着这张图，一按「换一换」就可能又抽到它，看着像按钮失效。
+//    ★ 这个集合**只在内存里、不落盘**，每次切到本地标签（showEvent）都重置。
+//    ★ 重置时**不是清成空**，而是置成"只剩屏幕上那张"。
 //
-//  ★ 为什么这些图放磁盘、不进 .qrc ★
+//  ★ 为什么图片放磁盘、不进 .qrc ★
 //    双击要"用图片查看器看原图"，而系统看图工具只认**真实文件路径**；
-//    qrc 里的 `:/daily_image/xxx.jpg` 是虚拟路径，扔给外部程序是打不开的。
-//    所以 resources/daily_image/ 保持成普通文件夹，运行时去磁盘上找。
-//    附带好处：往里丢新图，重启程序就能看见 —— 不用改 .qrc、不用重新编译。
-//
-//  ★ 代价（得知道）★
-//    图片不再编进 exe，所以把 PetPal.exe 单独拷走时这一页会是空的。
-//    程序里的查找顺序见 findDailyImageDir()，找不到会在页面上写清楚找过哪些位置。
+//    qrc 里的虚拟路径外部程序打不开。resources/daily_image/ 保持成普通文件夹。
+//    联网标签双击保存的图也落在这里，自动进入本地图库。
 // =============================================================================
 
 #include <QWidget>
@@ -36,6 +28,7 @@
 #include <QSize>
 #include <QByteArray>
 
+#include "DuitangFetcher.h"
 #include "PixivFetcher.h"
 
 class QLabel;
@@ -55,31 +48,60 @@ public:
     // 界面字号档位变了之后重新套样式表（见 UiFont.h）
     void applyUiScale();
 
-    // 检查"今天该显示哪张"。由 showEvent 调用（切到这一页 / 重新打开面板时都会走）。
+    // 检查"本地标签今天该显示哪张"。由 showEvent 调用（切到这一页都会走）。
     // 同一天里反复调用不会换图 —— 换不换由日期决定，不由调用次数决定。
     void refreshForToday();
 
-    // 给 --selftest 用。这一页是"一天才变一次"的功能，坏了也看不出来（顶多觉得
-    // "怎么每次打开都不一样"），所以把目录、图片数、存档里记的日期写进报告。
-    // static 且纯只读：不建窗口、不解码图片、不碰存档 —— 自检不该为了描述它
-    // 就把一张 7000px 的插画读进内存。
+    // 给 --selftest 用。纯只读：不建窗口、不解码图片、不碰存档、不触网。
     static QString describeDailyImage();
 
 protected:
     void resizeEvent(QResizeEvent* event) override;
     void showEvent(QShowEvent* event) override;
-    bool eventFilter(QObject* obj, QEvent* event) override;   // 双击图片 -> 系统看图工具
+    bool eventFilter(QObject* obj, QEvent* event) override;   // 双击图片 -> 保存/打开
 
 private slots:
-    void onShuffle();               // 「换一换」：随机换一张，并把结果记进存档
+    void onShuffle();               // 「换一换」：按当前标签各自的方式换一张
 
 private:
-    // ---- 联网（Pixiv）标签 ----
-    void setOnlineMode(bool on);    // 本地 / 联网 切换
-    void beginOnlineSearch();       // 随机页码搜一批（结果乱序入池）
-    void prefetchNext();            // 从池里取下一个：详情 → 大图字节 → 进缓存
-    void showNextOnline();          // 从缓存弹一张显示；缓存空则催补货
-    void applyOnlineImage();        // 把当前联网图放进显示管线（走 m_source 那套缩放）
+    // ---- 联网标签（Pixiv / 堆糖）：每个源一份独立状态 ----
+    enum { SourcePixiv = 0, SourceDuitang = 1 };
+
+    struct OnlineState
+    {
+        QVector<PixivFetcher::Illust> pool;   // 一次搜索的结果（已乱序）
+        int  poolPos    = 0;                  // 池消费到哪了
+        struct OnlinePic
+        {
+            PixivFetcher::Illust info;
+            QByteArray  bytes;                // 原始字节（双击保存用）
+            QPixmap     pm;                   // 解码结果（显示用）
+        };
+        QVector<OnlinePic> cache;             // 预取好的图
+        bool tried     = false;               // 本次运行是否已经搜过
+        bool fetching  = false;               // 有一张图正在取（防重入）
+        bool awaitShow = false;               // 用户点了换一换但缓存还空 → 到货自动上屏
+        int  failRun   = 0;                   // 连续失败计数（≥3 才报错，偶发失败静默跳过）
+        int  gen       = 0;                   // 回调流水号：重搜/切标签时 +1，过期回调按它丢弃
+        int  duitangTotal = 0;                // 堆糖当前关键词命中总数（随机跳页用）
+
+        QByteArray  bytes;                    // 当前显示这张的原始字节（双击保存用）
+        QString     saveId;                   // 当前显示这张的保存名（pixiv_xxx / duitang_xxx）
+        QString     title;                    // 底栏文字用
+        QString     artist;
+        QPixmap     source;                   // 显示缓存（切标签往返不丢）
+        QSize       size;                     // 原图尺寸
+    };
+
+    void setTab(int id);                 // 0 = 本地,1 = Pixiv,2 = 堆糖
+    void beginOnlineSearch(int duitangStart = -1);   // 按当前图源搜一批（duitangStart ≥0 = 指定堆糖偏移）
+    void ingestOnline(int srcIdx, QVector<PixivFetcher::Illust> list);   // 乱序入池 + 上第一张
+    void prefetchNext(int srcIdx);       // 从池里取下一个：补齐直链 → 字节 → 进缓存
+    void handleOnlineBytes(int srcIdx, int gen, const PixivFetcher::Illust& info,
+                           bool ok, const QByteArray& bytes, const QString& err);
+    void showNextOnline(int srcIdx);     // 从缓存弹一张显示；缓存空则催补货
+    void applyOnlineImage(int srcIdx);   // 把当前联网图放进显示管线（走 m_source 那套缩放）
+    QString onlineCaption(const OnlineState& st) const;   // 联网图底栏文字
 
     void           applyStyle();            // 整页样式表（构造时和改字号时共用）
     QString        pickTodayImage();        // 今天的图（今天已经挑过就沿用，否则随机）
@@ -97,11 +119,11 @@ private:
 
     QLabel*      m_image      = nullptr;   // 图片本体
     QLabel*      m_caption    = nullptr;   // 文件名 · 原图尺寸 · 双击提示
-    QLabel*      m_progress   = nullptr;   // 本次进度（放标题行左侧，见构造函数里的说明）
+    QLabel*      m_progress   = nullptr;   // 本次进度（本地标签专属）
     QPushButton* m_shuffleBtn = nullptr;   // 「换一换」
 
     QString m_dir;           // daily_image 的绝对路径（找不到时为空）
-    QString m_currentPath;   // 当前这张图的绝对路径
+    QString m_currentPath;   // 当前这张图的绝对路径（联网标签下为空）
     // ★ m_source 是"够用"的那一版，不一定是原图 ★
     //   用户的插画动辄几千像素（本机实测有 7000px 的）。每换一次窗口大小就从原图
     //   平滑缩一次是"目标像素数 × 缩放倍数"级别的开销，而窗口一变就会连着来
@@ -113,38 +135,19 @@ private:
     QTimer* m_rescaleTimer = nullptr;   // 缩放节流：停手后才做一次平滑缩放
     bool    m_persistent = true;   // false = 不写存档（自检用）
 
-    // ★ 本次打开这一页期间"已经看过的图"（存放磁盘文件名，不是下标）★
-    //   存文件名而不是下标：用户随时会往 daily_image 里加/删图，
-    //   下标一变标记全部错位；比名字则天然适应 ——
-    //   删掉的图自然消失，**新加的图因为不在集合里，会被优先抽中**。
+    // ★ 本地标签：本次打开期间"已经看过的图"（存放磁盘文件名，不是下标）★
+    //   存文件名而不是下标：用户随时会往 daily_image 里加/删图，比名字天然适应。
     //   只在内存里，showEvent 里重置（见 .cpp）。
     QSet<QString> m_seenThisOpen;
 
-    // ---- 联网（Pixiv）标签的状态 ----
-    //  缓存 = 已拉好字节的图，显示零等待；「换一换」弹一张、后台自动补一张。
-    //  池 = 一次搜索的结果（已乱序）；用完随机换一页重搜。
-    //  ★ 全部内存态、不落盘 ★ —— 联网是"看图"功能，没有"每日固定一张"的语义。
-    QButtonGroup* m_modeGroup  = nullptr;   // 本地 / 联网 互斥
+    // ---- 三个标签的骨架与联网状态 ----
+    //  每个联网源一份 OnlineState：池/缓存/当前图互不串，切标签就是切状态。
+    //  ★ 联网态全部内存态、不落盘 ★ —— 联网是"看图"，没有"每日固定一张"的语义。
+    QButtonGroup* m_tabGroup   = nullptr;   // 本地 / Pixiv / 堆糖 三选一
     QPushButton*  m_localTab   = nullptr;
-    QPushButton*  m_onlineTab  = nullptr;
-    bool          m_onlineMode  = false;    // 当前是不是联网标签
-    bool          m_onlineTried = false;    // 本次运行是否已经搜过（切回不再重搜）
-    bool          m_fetching    = false;    // 有一张图正在取（防重入）
-    bool          m_awaitShow   = false;    // 用户点了换一换但缓存还空 → 到货自动上屏
-    int           m_failRun     = 0;        // 连续失败计数（≥3 才报错，偶发失败静默跳过）
-    QVector<PixivFetcher::Illust> m_onlinePool;   // 搜索结果（已乱序）
-    int           m_poolPos    = 0;          // 池消费到哪了
-    struct OnlinePic
-    {
-        PixivFetcher::Illust info;
-        QByteArray  bytes;      // 原始字节（双击保存用）
-        QPixmap     pm;         // 解码结果（显示用）
-    };
-    QVector<OnlinePic> m_cache;          // 预取好的图
-    QByteArray  m_onlineBytes;           // 当前显示这张的原始字节（双击保存用）
-    QString     m_onlineId;              // 当前显示这张的作品 ID
-    QString     m_onlineTitle;           // 当前显示这张的标题（底栏文字用）
-    QString     m_onlineArtist;          // 当前显示这张的画师（底栏文字用）
-    QPixmap     m_onlineSource;          // 联网图的"显示缓存"（切标签往返不丢）
-    QSize       m_onlineSize;            // 联网图原图尺寸（底栏文字用）
+    QPushButton*  m_pixivTab   = nullptr;
+    QPushButton*  m_duitangTab = nullptr;
+    int           m_tab        = 0;         // 当前标签（0 本地 / 1 Pixiv / 2 堆糖，
+                                            //  ui.ini dailyImage/tab 记忆）
+    OnlineState   m_online[2];               // [SourcePixiv] / [SourceDuitang]
 };

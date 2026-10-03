@@ -94,8 +94,12 @@ set(PROJECT_SOURCES
     src/DesktopLyrics.cpp
     src/OnlineMusic.h
     src/OnlineMusic.cpp
+    src/NetEnv.h
+    src/NetEnv.cpp
     src/PixivFetcher.h
     src/PixivFetcher.cpp
+    src/DuitangFetcher.h
+    src/DuitangFetcher.cpp
     src/MfDecode.h
     src/MfDecode.cpp
     src/FlacEncode.h
@@ -238,7 +242,9 @@ set(PETPAL_HEADERS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/PetFx.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/DesktopLyrics.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/OnlineMusic.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/NetEnv.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/PixivFetcher.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/DuitangFetcher.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/MfDecode.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/FlacEncode.h"
 )
@@ -264,7 +270,9 @@ set_property(SOURCE
     src/PetFx.cpp
     src/DesktopLyrics.cpp
     src/OnlineMusic.cpp
+    src/NetEnv.cpp
     src/PixivFetcher.cpp
+    src/DuitangFetcher.cpp
     src/MfDecode.cpp
     src/FlacEncode.cpp
     APPEND PROPERTY OBJECT_DEPENDS ${PETPAL_HEADERS}
